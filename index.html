@@ -133,7 +133,7 @@ async function api(op,b){const w=(cfg.worker||'').replace(/\/+$/,'');if(!w)retur
 function acui(){const p=ME&&ME.prem>Date.now();$('acs').innerHTML=AU&&ME?`<b>${esc(AU.u)}</b> · ${p?'Premium jusqu’au '+new Date(ME.prem).toLocaleDateString():'Gratuit'}<br>Comptes vérifiés : ${ME.links.map(x=>esc(x.n)+' ('+(x.p=='lichess'?'Lichess':'Chess.com')+')').join(', ')||'aucun'}`:'Non connecté';$('adm').style.display=ME&&ME.admin?'':'none';
  $('navbal').textContent=ME?`💎 ${ME.pts} pt · 🎟 ${ME.tokens} token(s)`:'';
  $('shbal').textContent=ME?`💎 ${ME.pts} points · 🎟 ${ME.tokens} token(s) IA restants · ${p?'Premium actif jusqu’au '+new Date(ME.prem).toLocaleDateString():'Compte gratuit'}`:'';
- const CP=[[1,1],[2,2],[5,7],[10,15]];
+ const CP=[[5,7]]; // seul palier actif pour l’instant (plan PlatoBoost limité à un boost à la fois)
  if($('shcp'))$('shcp').innerHTML=CP.map(([t,pt])=>`<div class="row" style="margin:6px 0"><b>${t} checkpoint${t>1?'s':''}</b><span>(${pt} pt${pt>1?'s':''} de base)</span><button class="b" onclick="pbLink(${t})">Obtenir le lien</button><input id="pbk${t}" placeholder="Colle ta clé PlatoBoost"><button class="b" onclick="pbClaim(${t})">Valider</button></div>`).join('')}
 async function refresh(){if(!AU)return acui();const r=await api('me');if(r.error){$('am').textContent=r.error;if(/incorrect|introuvable/i.test(r.error)){AU=null;localStorage.eaS='null'}ME=null}else{ME=r;localStorage.eaS=JSON.stringify(AU);$('am').textContent=''}acui()}
 async function login(reg){const u=$('au').value.trim(),p=$('ap').value;if(!u||!p)return;AU={u,h:await hh(u,p)};if(reg){const r=await api('reg');if(r.error){AU=null;return $('am').textContent=r.error}}await refresh()}
@@ -472,6 +472,7 @@ $('chs').onclick=sendChat;$('chi').addEventListener('keydown',e=>{if(e.key=='Ent
 $('chc').onclick=()=>{chat=[];st.chat=chat;save();drawChat()};
 drawChat();
 /* Dissuasion cosmétique : ne bloque pas un utilisateur déterminé (menu navigateur, view-source:, outils dev déjà ouverts) */
-
+document.addEventListener('keydown',e=>{const k=e.key.toLowerCase();if((e.ctrlKey||e.metaKey)&&(k=='u'||(e.shiftKey&&['i','j','c'].includes(k)))||k=='f12')e.preventDefault()});
+document.addEventListener('contextmenu',e=>e.preventDefault());
 rend();
 </script></body></html>
