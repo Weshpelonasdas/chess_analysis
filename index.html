@@ -472,7 +472,6 @@ $('chs').onclick=sendChat;$('chi').addEventListener('keydown',e=>{if(e.key=='Ent
 $('chc').onclick=()=>{chat=[];st.chat=chat;save();drawChat()};
 drawChat();
 /* Dissuasion cosmétique : ne bloque pas un utilisateur déterminé (menu navigateur, view-source:, outils dev déjà ouverts) */
-document.addEventListener('keydown',e=>{const k=e.key.toLowerCase();if((e.ctrlKey||e.metaKey)&&(k=='u'||(e.shiftKey&&['i','j','c'].includes(k)))||k=='f12')e.preventDefault()});
-document.addEventListener('contextmenu',e=>e.preventDefault());
+
 rend();
 </script></body></html>
