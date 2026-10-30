@@ -1,333 +1,478 @@
-// Cloudflare Worker — comptes, premium, vérification, classement, matchmaking 1v1 (KV)
-// KV namespace lié sous le nom CHESS. Le compte "admin" (à créer EN PREMIER) génère les codes.
-const cors = { "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Headers": "Content-Type", "Access-Control-Allow-Methods": "POST,OPTIONS" };
-const out = (o, s = 200) => new Response(JSON.stringify(o), { status: s, headers: { ...cors, "Content-Type": "application/json" } });
-const FREE = { su: 1, pz: 3, td: 1, jo: 1 }; // utilisations gratuites par jour (résumé, problèmes, à travailler, jouer)
-const DAILY_TOKENS = 5; // tokens IA gratuits offerts chaque jour (comptes non premium)
-const CP_POINTS = { 1: 1, 2: 2, 5: 7, 10: 15 }; // points gagnés par palier de checkpoints PlatoBoost
-const PREM_COST = { 1: 5, 2: 9, 7: 30, 30: 99 }; // points -> jours de Premium
-// IDs de service PlatoBoost : à remplacer par les 4 vrais service IDs créés dans le dashboard PlatoBoost (un par palier de checkpoints).
-const PB_SERVICE = { 1: 0, 2: 0, 5: 0, 10: 0 };
-const day = () => new Date().toISOString().slice(0, 10);
-const isSunday = () => new Date().getUTCDay() === 0;
-const rnd = (n) => [...crypto.getRandomValues(new Uint8Array(n))].map((x) => "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"[x % 32]).join("");
-
-async function getJson(url) {
-  try {
-    const r = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0 (compatible; ChessAnalyses/1.0; +https://chess-analyses)", Accept: "application/json" } });
-    if (!r.ok) return null;
-    return await r.json();
-  } catch { return null; }
-}
-async function rate(p, n) {
-  if (p === "chesscom") {
-    const j = await getJson("https://api.chess.com/pub/player/" + encodeURIComponent(n.toLowerCase()) + "/stats");
-    if (!j) return null;
-    const g = (k) => (j["chess_" + k] && j["chess_" + k].last && j["chess_" + k].last.rating) || 0;
-    return { bullet: g("bullet"), blitz: g("blitz"), rapid: g("rapid") };
-  }
-  const j = await getJson("https://lichess.org/api/user/" + encodeURIComponent(n));
-  if (!j) return null;
-  // Un Elo "?" sur Lichess (provisoire ou jamais joué) ne doit pas compter dans le classement.
-  const prov = (k) => !j.perfs || !j.perfs[k] || j.perfs[k].prov || !j.perfs[k].games;
-  const g = (k) => (prov(k) ? 0 : j.perfs[k].rating) || 0;
-  return { bullet: g("bullet"), blitz: g("blitz"), rapid: g("rapid") };
-}
-// Texte public du profil (chess.com : champ "localisation" ; Lichess : bio). Renvoie {text, error} pour pouvoir diagnostiquer.
-async function profile(p, n) {
-  const url = p === "chesscom" ? "https://api.chess.com/pub/player/" + encodeURIComponent(n.toLowerCase()) : "https://lichess.org/api/user/" + encodeURIComponent(n);
-  const site = p === "chesscom" ? "chess.com" : "Lichess";
-  for (let i = 0; i < 3; i++) {
-    try {
-      const r = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0 (compatible; ChessAnalyses/1.0; +https://chess-analyses)", Accept: "application/json" } });
-      if (r.status === 429) { if (i < 2) { await new Promise((res) => setTimeout(res, 1200 * (i + 1))); continue; } return { text: "", error: site + " bloque temporairement les requêtes depuis ce serveur (429). Réessaie dans quelques minutes, ou tente via " + (p === "chesscom" ? "Lichess" : "chess.com") + " si le blocage persiste." }; }
-      if (r.status === 404) return { text: "", error: "Pseudo introuvable sur " + site + "." };
-      if (!r.ok) return { text: "", error: "Le site a répondu une erreur (" + r.status + "). Réessaie dans une minute." };
-      const j = await r.json();
-      return { text: JSON.stringify(j), error: null };
-    } catch (e) { return { text: "", error: "Impossible de joindre " + site + " depuis le serveur." }; }
-  }
-}
-
-// ---- PlatoBoost (secret et clés restent côté Worker, jamais envoyés au client) ----
-// À configurer en Secrets du Worker (Settings > Variables) : PB_SECRET (le "secret" du compte PlatoBoost).
-async function pbHash(parts, secret) { const d = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(parts.join("-") + "-" + secret)); return [...new Uint8Array(d)].map((x) => x.toString(16).padStart(2, "0")).join(""); }
-async function pbStart(service, identifier, env) {
-  const r = await fetch("https://api.platoboost.com/public/start", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ service, identifier }) });
-  const j = await r.json().catch(() => ({}));
-  if (j && j.success) return { url: j.data.url };
-  return { error: (j && j.message) || "Impossible d’obtenir le lien PlatoBoost." };
-}
-async function pbVerify(service, identifier, key, env) {
-  const nonce = rnd(8), secret = env.PB_SECRET || "";
-  let j = await fetch(`https://api.platoboost.com/public/whitelist/${service}?identifier=${encodeURIComponent(identifier)}&key=${encodeURIComponent(key)}&nonce=${nonce}`).then((r) => r.json()).catch(() => null);
-  if (j && j.success && j.data.valid) {
-    const h = await pbHash(["true", nonce], secret);
-    if (j.data.hash !== h) return { error: "Échec de vérification d’intégrité PlatoBoost." };
-    return { valid: true };
-  }
-  if (key.startsWith("KEY_")) {
-    const nonce2 = rnd(8);
-    j = await fetch(`https://api.platoboost.com/public/redeem/${service}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ identifier, key, nonce: nonce2 }) }).then((r) => r.json()).catch(() => null);
-    if (j && j.success && j.data.valid) {
-      const h = await pbHash(["true", nonce2], secret);
-      if (j.data.hash !== h) return { error: "Échec de vérification d’intégrité PlatoBoost." };
-      return { valid: true };
-    }
-    return { error: (j && j.message) || "Clé invalide ou déjà utilisée." };
-  }
-  return { error: "Clé invalide." };
-}
-
-// ---- Appel IA mutualisé (comptes gratuits, consomme un token) ----
-// À configurer en Secrets du Worker : SHARED_AI_URL (ex. https://openrouter.ai/api/v1), SHARED_AI_KEY, SHARED_AI_MODEL, SHARED_AI_MODEL_LIGHT.
-async function sharedAI(messages, mode, env) {
-  if (!env.SHARED_AI_KEY) return { error: "IA mutualisée non configurée par l’administrateur du site." };
-  const model = mode === "full" ? env.SHARED_AI_MODEL : (env.SHARED_AI_MODEL_LIGHT || env.SHARED_AI_MODEL);
-  try {
-    const r = await fetch((env.SHARED_AI_URL || "https://openrouter.ai/api/v1").replace(/\/+$/, "") + "/chat/completions", { method: "POST", headers: { "Content-Type": "application/json", Authorization: "Bearer " + env.SHARED_AI_KEY }, body: JSON.stringify({ model, messages }) });
-    const j = await r.json().catch(() => ({}));
-    const tx = j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content;
-    if (tx) return { text: tx };
-    return { error: (j.error && j.error.message) || "Erreur du fournisseur IA partagé." };
-  } catch (e) { return { error: e.message }; }
-}
-
-// Golden Sunday : une fois par semaine, +7 jours de Premium offerts au n°1 du classement.
-// Ce handler est déclenché par un Cron Trigger Cloudflare à configurer dans le dashboard
-// (Worker > Settings > Trigger Events > Cron Trigger), expression conseillée : 0 0 * * 0 (dimanche 00:00 UTC).
-async function goldenSunday(env) {
-  const L = (await env.CHESS.get("lb", "json")) || [];
-  if (!L.length) return;
-  const score = (x) => Math.max(x.r.blitz || 0, x.r.rapid || 0, x.r.bullet || 0);
-  const best = L.reduce((a, b) => (score(b) > score(a) ? b : a));
-  const owner = await env.CHESS.get("link:" + best.p + ":" + best.n.toLowerCase());
-  if (!owner) return;
-  const key = "user:" + owner;
-  const rec = await env.CHESS.get(key, "json");
-  if (!rec) return;
-  rec.prem = Math.max(Date.now(), rec.prem || 0) + 7 * 864e5;
-  rec.golden = (rec.golden || 0) + 1;
-  await env.CHESS.put(key, JSON.stringify(rec));
-  await env.CHESS.put("goldenLast", JSON.stringify({ u: owner, name: best.n, p: best.p, rating: score(best), t: Date.now() }));
-}
-
-export default {
-  async scheduled(event, env, ctx) {
-    ctx.waitUntil(goldenSunday(env));
-  },
-  async fetch(req, env) {
-    if (req.method === "OPTIONS") return new Response(null, { headers: cors });
-    if (req.method !== "POST") return out({ error: "POST uniquement" }, 405);
-    const op = new URL(req.url).pathname.replace(/^\/+|\/+$/g, "");
-    let b;
-    try { b = await req.json(); } catch { return out({ error: "JSON invalide" }, 400); }
-
-    if (op === "lb/golden") {
-      const g = await env.CHESS.get("goldenLast", "json");
-      return out({ golden: g || null });
-    }
-
-    if (op === "lb/list") {
-      let L = (await env.CHESS.get("lb", "json")) || [];
-      const lastR = +(await env.CHESS.get("lbRefreshed")) || 0;
-      if (Date.now() - lastR > 60000) {
-        await env.CHESS.put("lbRefreshed", String(Date.now()));
-        const old = L.filter((x) => Date.now() - x.t > 3.6e6).slice(0, 4);
-        for (const x of old) {
-          const r = await rate(x.p, x.n);
-          if (r) { x.r = r; x.t = Date.now(); }
-          await new Promise((res) => setTimeout(res, 400));
-        }
-        if (old.length) await env.CHESS.put("lb", JSON.stringify(L));
-      }
-      return out({ list: L });
-    }
-
-    if (op === "reset/start" || op === "reset/check") {
-      const ru = String(b.u || "").toLowerCase(), rkey = "user:" + ru;
-      const rrec = await env.CHESS.get(rkey, "json");
-      if (!rrec) return out({ error: "Compte introuvable" }, 404);
-      rrec.links = rrec.links || [];
-      if (!rrec.links.length) return out({ error: "Aucun compte chess.com ou Lichess vérifié sur ce profil : la réinitialisation est impossible." }, 400);
-      if (op === "reset/start") {
-        const link = rrec.links[0];
-        rrec.pendReset = { p: link.p, n: link.n, code: "RESET-" + rnd(6) };
-        await env.CHESS.put(rkey, JSON.stringify(rrec));
-        return out({ code: rrec.pendReset.code, p: link.p, n: link.n });
-      }
-      const pr = rrec.pendReset;
-      if (!pr) return out({ error: "Demande d’abord un code" }, 400);
-      if (!/^[a-f0-9]{64}$/.test(b.nh || "")) return out({ error: "Nouveau mot de passe invalide" }, 400);
-      const pf1 = await profile(pr.p, pr.n);
-      if (pf1.error) return out({ error: pf1.error }, 400);
-      if (!pf1.text.includes(pr.code)) return out({ error: "Code absent du profil : vérifie que tu l’as bien collé et sauvegardé, puis patiente une minute (le cache peut retarder)." }, 400);
-      rrec.h = b.nh; delete rrec.pendReset;
-      await env.CHESS.put(rkey, JSON.stringify(rrec));
-      return out({ msg: "Mot de passe réinitialisé ✔ Tu peux te connecter." });
-    }
-
-    const { u, h, data } = b;
-    if (!/^[\w.-]{2,32}$/.test(u || "") || !/^[a-f0-9]{64}$/.test(h || "")) return out({ error: "Identifiants invalides" }, 400);
-    const ul = u.toLowerCase(), key = "user:" + ul;
-    let rec = await env.CHESS.get(key, "json");
-    const put = () => env.CHESS.put(key, JSON.stringify(rec));
-
-    if (op === "reg") {
-      if (rec) return out({ error: "Ce nom d’utilisateur est déjà pris" }, 409);
-      rec = { h, data: {}, prem: 0, links: [], use: {}, pts: 0, tok: { d: "", n: 0 } };
-      await put();
-      return out({ msg: "Compte créé ✔" });
-    }
-    if (!rec) return out({ error: "Compte introuvable : crée-le d’abord" }, 404);
-    if (rec.h !== h) return out({ error: "Mot de passe incorrect" }, 403);
-    rec.links = rec.links || []; rec.use = rec.use || {}; rec.pts = rec.pts || 0; rec.tok = rec.tok || { d: "", n: 0 };
-    const prem = (rec.prem || 0) > Date.now(), verified = rec.links.length > 0;
-    if (rec.tok.d !== day()) { rec.tok = { d: day(), n: rec.tok.n + DAILY_TOKENS }; await put(); }
-
-    switch (op) {
-      case "save": {
-        if (JSON.stringify(data || {}).length > 5e6) return out({ error: "Données trop volumineuses" }, 413);
-        rec.data = data || {}; await put(); return out({ msg: "Sauvegardé ✔" });
-      }
-      case "load": return out({ msg: "Chargé ✔", data: rec.data });
-      case "me": return out({ prem: rec.prem || 0, links: rec.links, admin: ul === "admin", used: rec.use.d === day() ? rec.use.f : {}, free: FREE, pts: rec.pts, tokens: rec.tok.n, verified });
-      case "ai/call": {
-        if (rec.tok.n <= 0) return out({ error: "Plus de tokens IA aujourd’hui. Reviens demain ou achète des tokens dans la Boutique." }, 402);
-        const msgs = Array.isArray(b.messages) ? b.messages : null;
-        if (!msgs) return out({ error: "Requête invalide" }, 400);
-        const r = await sharedAI(msgs, b.mode, env);
-        if (r.error) return out({ error: r.error }, 502);
-        rec.tok.n -= 1; await put();
-        return out({ text: r.text, tokensLeft: rec.tok.n });
-      }
-      case "shop/pb_link": {
-        const tier = +b.tier, svc = PB_SERVICE[tier];
-        if (!svc) return out({ error: "Palier invalide ou non configuré par l’administrateur." }, 400);
-        const r = await pbStart(svc, "u_" + ul, env);
-        if (r.error) return out(r, 502);
-        return out({ url: r.url });
-      }
-      case "shop/pb_claim": {
-        if (!verified) return out({ error: "Compte chess.com/Lichess vérifié requis pour gagner des points (onglet Compte)." }, 403);
-        const tier = +b.tier, svc = PB_SERVICE[tier], key = String(b.key || "").trim();
-        if (!svc || !CP_POINTS[tier]) return out({ error: "Palier invalide." }, 400);
-        if (!key) return out({ error: "Colle ta clé PlatoBoost." }, 400);
-        const used = await env.CHESS.get("pbkey:" + key);
-        if (used) return out({ error: "Cette clé a déjà été utilisée." }, 409);
-        const r = await pbVerify(svc, "u_" + ul, key, env);
-        if (r.error) return out({ error: r.error }, 400);
-        let pts = CP_POINTS[tier];
-        if (prem) pts *= 2;
-        if (isSunday()) pts *= 2;
-        rec.pts += pts; await put();
-        await env.CHESS.put("pbkey:" + key, ul, { expirationTtl: 60 * 60 * 24 * 30 });
-        return out({ msg: `+${pts} points ✔`, pts: rec.pts });
-      }
-      case "shop/buy_tokens": {
-        const n = Math.max(1, Math.min(500, +b.n || 0));
-        if (rec.pts < n) return out({ error: "Pas assez de points." }, 402);
-        rec.pts -= n; rec.tok.n += n; await put();
-        return out({ msg: `+${n} tokens ✔`, pts: rec.pts, tokens: rec.tok.n });
-      }
-      case "shop/buy_premium": {
-        const days = +b.days, cost = PREM_COST[days];
-        if (!cost) return out({ error: "Durée invalide." }, 400);
-        if (rec.pts < cost) return out({ error: "Pas assez de points." }, 402);
-        rec.pts -= cost; rec.prem = Math.max(Date.now(), rec.prem || 0) + days * 864e5; await put();
-        return out({ msg: `Premium +${days} jour(s) ✔`, pts: rec.pts, prem: rec.prem });
-      }
-      case "admin/award_points": {
-        if (ul !== "admin") return out({ error: "Réservé au compte admin" }, 403);
-        const tu = String(b.u || "").toLowerCase(), tkey = "user:" + tu, pts = Math.max(1, Math.min(1000, +b.pts || 0));
-        const trec = await env.CHESS.get(tkey, "json");
-        if (!trec) return out({ error: "Utilisateur introuvable." }, 404);
-        if (!trec.links || !trec.links.length) return out({ error: "Ce compte n’est pas vérifié." }, 403);
-        trec.pts = (trec.pts || 0) + pts;
-        await env.CHESS.put(tkey, JSON.stringify(trec));
-        return out({ msg: `+${pts} points attribués à ${b.u} (${b.reason || "sans raison précisée"}) ✔` });
-      }
-      case "use": {
-        const f = b.f;
-        if (prem || FREE[f] === undefined) return out({ ok: true });
-        if (rec.use.d !== day()) rec.use = { d: day(), f: {} };
-        const n = rec.use.f[f] || 0;
-        if (n >= FREE[f]) return out({ ok: false, error: `Limite gratuite atteinte (${FREE[f]}/jour pour cette fonction). Passe en Premium pour la lever.` });
-        rec.use.f[f] = n + 1; await put();
-        return out({ ok: true, left: FREE[f] - n - 1 });
-      }
-      case "redeem": {
-        const c = String(b.code || "").trim().toUpperCase();
-        const cd = await env.CHESS.get("code:" + c, "json");
-        if (!cd) return out({ error: "Code invalide ou déjà utilisé" }, 404);
-        await env.CHESS.delete("code:" + c);
-        rec.prem = Math.max(Date.now(), rec.prem || 0) + cd.days * 864e5; await put();
-        return out({ msg: `Premium activé : +${cd.days} jours ✔`, prem: rec.prem });
-      }
-      case "admin/gen": {
-        if (ul !== "admin") return out({ error: "Réservé au compte admin" }, 403);
-        const days = Math.max(1, Math.min(3650, +b.days || 30)), n = Math.max(1, Math.min(20, +b.n || 1)), codes = [];
-        for (let i = 0; i < n; i++) { const c = rnd(4) + "-" + rnd(4) + "-" + rnd(4); await env.CHESS.put("code:" + c, JSON.stringify({ days })); codes.push(c); }
-        return out({ codes, days });
-      }
-      case "link/start": {
-        const p = b.p === "lichess" ? "lichess" : "chesscom", n = String(b.n || "").trim();
-        if (!/^[\w-]{2,30}$/.test(n)) return out({ error: "Pseudo invalide" }, 400);
-        rec.pend = { p, n, code: "CHESS-" + rnd(6) }; await put();
-        return out({ code: rec.pend.code });
-      }
-      case "link/check": {
-        const pd = rec.pend;
-        if (!pd) return out({ error: "Demande d’abord un code" }, 400);
-        const pf2 = await profile(pd.p, pd.n);
-        if (pf2.error) return out({ error: pf2.error }, 400);
-        if (!pf2.text.includes(pd.code)) return out({ error: "Code absent du profil : vérifie que tu l’as bien collé et sauvegardé, puis patiente une minute (le cache peut retarder)." }, 400);
-        const lk = "link:" + pd.p + ":" + pd.n.toLowerCase(), owner = await env.CHESS.get(lk);
-        if (owner && owner !== ul) return out({ error: "Ce compte est déjà lié à un autre utilisateur" }, 409);
-        await env.CHESS.put(lk, ul);
-        rec.links = rec.links.filter((x) => !(x.p === pd.p && x.n.toLowerCase() === pd.n.toLowerCase()));
-        rec.links.push({ p: pd.p, n: pd.n }); delete rec.pend; await put();
-        return out({ msg: "Compte vérifié ✔", links: rec.links });
-      }
-      case "lb/add": {
-        const p = b.p === "lichess" ? "lichess" : "chesscom", n = String(b.n || "").trim();
-        if (!rec.links.some((x) => x.p === p && x.n.toLowerCase() === n.toLowerCase())) return out({ error: "Vérifie d’abord ce compte (onglet Compte)" }, 403);
-        const r = await rate(p, n);
-        if (!r) return out({ error: "Joueur introuvable" }, 404);
-        let L = (await env.CHESS.get("lb", "json")) || [];
-        L = L.filter((x) => !(x.p === p && x.n.toLowerCase() === n.toLowerCase()));
-        L.push({ p, n, r, t: Date.now() }); L = L.slice(-500);
-        await env.CHESS.put("lb", JSON.stringify(L));
-        return out({ msg: "Ajouté ✔", list: L });
-      }
-      // ---- matchmaking : variable "room" = pseudos en recherche ; signalisation WebRTC via KV ----
-      case "mm/join": {
-        const now = Date.now(), name = String(b.name || "").slice(0, 40);
-        let room = (await env.CHESS.get("room", "json")) || [];
-        room = room.filter((x) => now - x.t < 45000 && x.u !== u);
-        room.push({ u, name, t: now });
-        await env.CHESS.put("room", JSON.stringify(room));
-        return out({ room: room.filter((x) => x.u !== u).map((x) => ({ u: x.u, name: x.name })) });
-      }
-      case "mm/leave": {
-        let room = (await env.CHESS.get("room", "json")) || [];
-        await env.CHESS.put("room", JSON.stringify(room.filter((x) => x.u !== u)));
-        return out({});
-      }
-      case "mm/offer":
-        await env.CHESS.put("sig:" + String(b.to).toLowerCase(), JSON.stringify({ from: u, name: b.name, sdp: b.sdp }), { expirationTtl: 120 });
-        return out({});
-      case "mm/answer":
-        await env.CHESS.put("ans:" + String(b.to).toLowerCase(), String(b.sdp), { expirationTtl: 120 });
-        return out({});
-      case "mm/poll": {
-        const k1 = "sig:" + ul, k2 = "ans:" + ul;
-        const offer = await env.CHESS.get(k1, "json"), answer = await env.CHESS.get(k2);
-        if (offer) await env.CHESS.delete(k1);
-        if (answer) await env.CHESS.delete(k2);
-        return out({ offer, answer });
-      }
-    }
-    return out({ error: "Route inconnue" }, 404);
-  },
-};
+<!doctype html><html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>CHESS ANALYSIS</title><link rel="preconnect" href="https://fonts.googleapis.com"><link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,600&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/chess.js/0.10.3/chess.min.js"></script>
+<style>
+:root{--bg:#FBFBFA;--c:#fff;--t:#1A1A1A;--a:#7A1F2B;--l:#ECE8DA;--d:#8C9366;--b:#1a1a1a26;--m:#6b6b66;--serif:'Fraunces',Georgia,serif;--mono:'DM Mono',ui-monospace,Menlo,Consolas,monospace}
+@media(prefers-color-scheme:dark){:root{--bg:#141413;--c:#1b1b1a;--t:#F2F0EA;--b:#f2f0ea2e;--m:#9a9890;--a:#d4707d}}
+body[data-th=bois]{--l:#f0d9b5;--d:#b58863}body[data-th=bleu]{--l:#dee3e6;--d:#6f8ea3}body[data-th=nuit]{--l:#9aa5b8;--d:#34425c}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--t);font:14px/1.6 var(--mono)}
+nav{display:flex;flex-wrap:wrap;align-items:baseline;gap:0 22px;padding:24px 5vw 0;border-bottom:1px solid var(--b)}
+nav b{font:600 26px/1 var(--serif);letter-spacing:.01em;text-transform:uppercase;margin-right:auto;padding-bottom:16px}
+.logo{display:inline-flex;align-items:center;justify-content:center;color:var(--a);margin-bottom:16px}
+nav button{border:0;background:none;color:var(--m);font:500 11px var(--mono);text-transform:uppercase;letter-spacing:.12em;padding:10px 0 13px;cursor:pointer;border-bottom:2px solid transparent;margin-bottom:-1px}
+nav button:hover{color:var(--t)}nav button.on{color:var(--t);border-color:var(--a)}nav select{margin-left:auto;align-self:center}
+main{max-width:1180px;margin:auto;padding:36px 5vw 90px}.tab{display:none}.tab.on{display:block;animation:fi .35s}@keyframes fi{from{opacity:0;transform:translateY(8px)}}
+h2.hd{font:400 clamp(44px,8vw,96px)/.92 var(--serif);letter-spacing:-.035em;margin:6px 0 20px}h3{font:600 22px var(--serif);letter-spacing:-.01em;margin:0 0 12px}
+.lead{max-width:46ch;margin:0 0 44px 33%;color:var(--m)}.meta{color:var(--m);font-size:12px;padding:8px 0}a{color:var(--a)}
+.card{border-top:1px solid var(--b);padding:18px 0;margin:0}.row{display:flex;gap:10px 14px;flex-wrap:wrap;align-items:center}
+.grid{display:grid;grid-template-columns:minmax(300px,500px) minmax(260px,1fr);gap:20px 56px;align-items:start}
+@media(max-width:820px){.grid{grid-template-columns:1fr}.lead{margin-left:0}}
+button.b{background:var(--t);color:var(--bg);border:1px solid var(--t);border-radius:0;font:500 11px var(--mono);text-transform:uppercase;letter-spacing:.1em;padding:9px 14px;cursor:pointer;transition:.15s}
+button.b:hover{background:var(--a);border-color:var(--a);color:#fff}button.b:disabled{opacity:.4}
+select,input:not([type=checkbox]):not([type=file]){border:0;border-bottom:1px solid var(--t);border-radius:0;background:transparent;color:var(--t);font:13px var(--mono);padding:8px 4px;max-width:100%}
+input:focus,select:focus,textarea:focus{outline:0;border-color:var(--a)}textarea{width:100%;min-height:80px;background:transparent;color:var(--t);border:1px solid var(--b);border-radius:0;font:13px var(--mono)}
+#wrap{position:relative;width:min(92vw,500px)}#ar,#par,#jar{position:absolute;inset:0;pointer-events:none;width:100%;height:100%}
+#bd,#pbd,#jbd,#mbd{display:grid;grid-template-columns:repeat(8,1fr);grid-template-rows:repeat(8,1fr);aspect-ratio:1;border:1px solid var(--t)}
+.sq{position:relative;display:flex;align-items:center;justify-content:center;aspect-ratio:1;min-height:0;overflow:hidden;font-size:min(9vw,46px);line-height:1;cursor:pointer;touch-action:none;user-select:none}
+.w{background:var(--l)}.k{background:var(--d)}.hl{box-shadow:inset 0 0 0 100px #ffeb3b66}.sl{box-shadow:inset 0 0 0 4px var(--a)}
+.lg::after{content:'';position:absolute;top:37%;left:37%;width:26%;height:26%;border-radius:50%;background:#1a1a1a55;pointer-events:none}
+.pw{color:#fff;text-shadow:0 0 2px #000,0 0 2px #000}.pb{color:#111}.sq span{filter:drop-shadow(0 2px 1px #0005)}
+.pop{display:inline-block;animation:pop .28s}@keyframes pop{0%{transform:scale(1.4)}100%{transform:scale(1)}}
+.mateKing span{animation:mateSpin .7s ease forwards;color:#c0392b!important;text-shadow:0 0 6px #c0392baa!important}@keyframes mateSpin{0%{transform:rotate(0)}100%{transform:rotate(90deg)}}
+.co{position:absolute;font:500 10px var(--mono);pointer-events:none;font-style:normal}.co.r{top:2px;left:3px}.co.f{bottom:1px;right:3px}.w .co{color:var(--d)}.k .co{color:var(--l)}
+.mv{border:0;background:none;color:var(--t);font:inherit;padding:1px 5px;cursor:pointer}.mv.on{background:var(--t);color:var(--bg)}.dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:4px}
+#ml{max-height:200px;overflow:auto;line-height:2}.bub{border-left:2px solid var(--a);padding:6px 12px;margin:10px 0;white-space:pre-wrap}
+.todo{display:flex;gap:8px;align-items:center;padding:8px 0;border-bottom:1px solid var(--b)}.todo span{flex:1}.done span{text-decoration:line-through;opacity:.45}
+table{width:100%;border-collapse:collapse}td,th{padding:10px 8px;border-bottom:1px solid var(--b);text-align:left;vertical-align:top}
+.pt th{font:500 11px var(--mono);text-transform:uppercase;letter-spacing:.12em;color:var(--m);border-bottom:1px solid var(--t)}.pt th:last-child,.pt td:last-child{color:var(--a);font-weight:500}.pt td:first-child{font:400 18px var(--serif);width:52%}
+.msg{max-width:78%;padding:9px 13px;margin:8px 0;white-space:pre-wrap;line-height:1.55}
+.msg.u{margin-left:auto;background:var(--t);color:var(--bg)}
+.msg.a{margin-right:auto;border-left:2px solid var(--a)}
+.msg.sys{margin:8px auto;color:var(--m);font-size:12px;text-align:center}
+.evalbar{width:14px;background:#1a1a1a;position:relative;overflow:hidden;flex:none;border:1px solid var(--t)}
+.evalbar i{position:absolute;left:0;right:0;bottom:0;background:#f5f5f0;height:50%;transition:height .5s ease;display:block}
+</style></head><body>
+<nav><span class="logo" aria-hidden="true"><svg viewBox="0 0 40 40" width="22" height="22"><rect x="1" y="1" width="38" height="38" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M12 30 L12 24 Q12 20 15 18 L14 16 Q13.3 15 14 14 Q15 13.3 16 14 L17.3 15.3 Q20 14 23 15 Q27 16.4 27 21 L27 30 Z M14.5 18.5 a1 1 0 1 0 2 0 a1 1 0 1 0 -2 0" fill="currentColor"/><line x1="10" y1="30" x2="29" y2="30" stroke="currentColor" stroke-width="1.6"/></svg></span><b>CHESS ANALYSIS</b><button data-t="an" class="on">Analyse</button><button data-t="su">Résumé</button><button data-t="pz">Problèmes</button><button data-t="td">À travailler</button><button data-t="jo">Jouer</button><button data-t="mm">1v1</button><button data-t="ch">Coach IA</button><button data-t="op">Ouvertures</button><button data-t="to">Outils</button><button data-t="tu">Tuto</button><button data-t="cf">Confidentialité</button><button data-t="lb">Classement</button><button data-t="ia">Fournisseurs IA</button><button data-t="pa">Paramètres</button><button data-t="ac">Compte</button><button data-t="pr">Premium</button><button data-t="sh">Boutique</button><span id="navbal" class="meta" style="align-self:center;margin-left:8px"></span><select id="im" title="Mode IA"><option value="flash">⚡ Flash (léger)</option><option value="turbo">🚀 Turbo (Groq)</option><option value="full">🧠 Complet</option></select></nav>
+<main>
+<section id="an" class="tab on">
+<div class="card row"><select id="src"><option>chess.com</option><option>lichess</option></select><input id="usr" placeholder="Pseudo"><button class="b" id="imp">Importer</button><input type="file" id="fil" accept=".pgn" multiple><span id="ist"></span></div>
+<div class="card row"><select id="gs" style="flex:1;min-width:200px"></select><span id="pg"></span></div>
+<div class="grid"><div><div style="display:flex;gap:8px;align-items:stretch"><div class="evalbar" id="ebar"><i></i></div><div id="wrap"><div id="bd"></div><svg id="ar" viewBox="0 0 8 8"></svg></div></div>
+<div class="row" style="margin-top:8px"><button class="b" id="f0" title="Début (Origine)">⏮</button><button class="b" id="f1" title="Coup précédent (←)">◀ Précédent</button><button class="b" id="f2" title="Coup suivant (→)">Suivant ▶</button><button class="b" id="f3" title="Fin">⏭</button><button class="b" id="fl">⇅ Retourner</button><label><input type="checkbox" id="acc"> ⏩ Accéléré</label><button class="b" id="bl">▶ Meilleure ligne</button><button class="b" id="vr">↩ Revenir</button><b id="evl"></b></div></div>
+<div style="flex:1;min-width:260px"><div class="card"><div id="lv"><i>Importe ou choisis une partie.</i></div><div id="tx" class="bub" style="display:none"></div><button class="b" id="ca" style="display:none">🔄 Régénérer le commentaire</button></div>
+<div class="card" id="bst" style="display:none"><b>Meilleur coup (Stockfish) : <span id="bm"></span></b><div id="bx" class="bub" style="display:none"></div><button class="b" id="ex">Expliquer</button></div>
+<div class="card" id="ml"></div></div></div></section>
+<section id="su" class="tab"><div class="card row"><button class="b" id="run">Analyser toutes les parties</button><span id="sp"></span></div><div id="sr"></div></section>
+<section id="td" class="tab"><div class="card"><div class="row"><input id="tn" placeholder="Nouveau point à travailler" style="flex:1"><button class="b" id="ta">Ajouter</button><button class="b" id="tc">Vider les faits</button></div><div id="tl"></div></div></section>
+<section id="pz" class="tab"><div class="card row"><select id="pt"></select><button class="b" id="pn">Nouveau problème</button><input id="px" placeholder="Ou décris le thème (choisi par l’IA)…" style="flex:1;min-width:180px"><button class="b" id="pq">IA</button><b id="ps"></b></div>
+<div class="grid"><div style="position:relative;width:min(92vw,480px)"><div id="pbd"></div><svg id="par" viewBox="0 0 8 8" style="position:absolute;inset:0;pointer-events:none"></svg></div>
+<div class="card" style="flex:1;min-width:240px"><div id="pm" style="font-size:1.1em">Choisis un thème puis « Nouveau problème ».</div><div id="pi" style="opacity:.6;margin:6px 0"></div><div class="row"><button class="b" id="ph">💡 Indice</button><button class="b" id="pp">Passer</button></div></div></div></section>
+<section id="jo" class="tab"><div class="card row"><select id="jcol"><option value="w">Je joue les Blancs</option><option value="b">Je joue les Noirs</option></select><button class="b" id="jn">Nouvelle partie</button><span id="jinf"></span></div>
+<div class="grid"><div style="display:flex;gap:8px;align-items:stretch"><div class="evalbar" id="jbar"><i></i></div><div style="position:relative;width:min(92vw,480px)"><div id="jbd"></div><svg id="jar" viewBox="0 0 8 8" style="position:absolute;inset:0;pointer-events:none"></svg></div></div><div class="card" style="flex:1;min-width:240px"><b>🎓 Coach en direct</b><div id="jc" class="bub">Lance une partie : je commente chacun de tes coups.</div><div id="jr"></div></div></div></section>
+<section id="op" class="tab"><div id="ol"></div></section>
+<section id="ac" class="tab"><h2 class="hd">Compte</h2>
+<div class="row"><input id="au" placeholder="Utilisateur"><input id="ap" type="password" placeholder="Mot de passe"><button class="b" id="ag">Connexion</button><button class="b" id="agr">Créer le compte</button><button class="b" id="as">Sauvegarder mes données</button><button class="b" id="al">Charger</button><button class="b" id="ao">Déconnexion</button></div><div id="am" class="meta"></div>
+<div class="row" style="margin-top:6px"><button class="b" id="fp">Mot de passe oublié ?</button></div>
+<div id="fpb" style="display:none"><div class="row" style="margin-top:10px"><input id="fpu" placeholder="Utilisateur"><button class="b" id="fp1">Obtenir un code</button></div><div id="fpm" class="meta"></div>
+<div class="row" style="margin-top:6px"><input id="fpn" type="password" placeholder="Nouveau mot de passe"><button class="b" id="fp2">Vérifier et réinitialiser</button></div></div><div id="acs" class="card"></div>
+<div class="card"><h3>Vérifier un compte chess.com / Lichess</h3><div class="row"><select id="lvp"><option value="chesscom">Chess.com</option><option value="lichess">Lichess</option></select><input id="lvn" placeholder="Pseudo"><button class="b" id="lvo">Ouvrir le profil ↗</button><button class="b" id="lv1">Obtenir un code</button><button class="b" id="lv2">Vérifier</button></div><div id="lvm" class="meta"></div></div>
+<div class="card"><h3>Code Premium</h3><div class="row"><input id="cdc" placeholder="XXXX-XXXX-XXXX"><button class="b" id="cdb">Activer</button><span id="cdm"></span></div></div>
+<div class="card" id="adm" style="display:none"><h3>Administration : générer des codes</h3><div class="row"><input id="add" type="number" value="30" style="width:80px"> jours <input id="adn" type="number" value="1" style="width:60px"> codes <button class="b" id="adb">Générer</button></div><textarea id="ado" rows="4"></textarea>
+<h3 style="margin-top:14px">Attribuer des points (Cash Cup, Giveaway…)</h3><div class="row"><input id="awu" placeholder="Pseudo du gagnant"><input id="awp" type="number" placeholder="Points" style="width:90px"><input id="awr" placeholder="Raison (ex. Cash Cup)"><button class="b" id="awb">Attribuer</button></div><div id="awm" class="meta"></div></div></section>
+<section id="pr" class="tab"><h2 class="hd">Jouez sans limite.</h2><p class="lead">L’analyse reste gratuite et illimitée. Le Premium retire les plafonds quotidiens de tout le reste.</p>
+<table class="pt"><thead><tr><th>Fonction</th><th>Gratuit</th><th>Premium</th></tr></thead><tbody>
+<tr><td>Analyse Stockfish, commentaires IA, explications du coach</td><td>Illimitée</td><td>Illimitée</td></tr>
+<tr><td>Résumé de tes parties</td><td>1 / jour</td><td>Illimité</td></tr>
+<tr><td>Problèmes tactiques</td><td>3 / jour</td><td>Illimités</td></tr>
+<tr><td>Points à travailler (S’entraîner)</td><td>1 / jour</td><td>Illimité</td></tr>
+<tr><td>Partie contre le coach en direct</td><td>1 / jour</td><td>Illimitée</td></tr>
+<tr><td>1v1 en ligne</td><td>Avec compte</td><td>Avec compte</td></tr>
+<tr><td>Classement</td><td>Compte vérifié</td><td>Compte vérifié</td></tr>
+<tr><td>Ouvertures et outils</td><td>Avec compte</td><td>Avec compte</td></tr></tbody></table>
+<div class="row" style="margin-top:32px"><button class="b" onclick="document.querySelector('[data-t=ac]').click()">J’ai un code →</button></div></section>
+<section id="sh" class="tab"><h2 class="hd">Boutique</h2>
+<div class="card"><b id="shbal">—</b></div>
+<div class="card"><h3>Gagner des points (PlatoBoost)</h3><p>Complète un palier, reviens coller la clé qu’il t’a donnée. Nécessite un compte vérifié (onglet Compte). x2 si Premium, x2 le dimanche (cumulable).</p>
+<div id="shcp"></div></div>
+<div class="card"><h3>Acheter des tokens IA</h3><p>1 point = 1 token (1 requête IA).</p><div class="row"><input id="shtn" type="number" min="1" value="5" style="width:80px"><button class="b" id="shtb">Acheter</button></div></div>
+<div class="card"><h3>Débloquer Premium</h3><div class="row"><button class="b" onclick="buyPrem(1)">1 jour — 5 pts</button><button class="b" onclick="buyPrem(2)">2 jours — 9 pts</button><button class="b" onclick="buyPrem(7)">7 jours — 30 pts</button><button class="b" onclick="buyPrem(30)">1 mois — 99 pts</button></div></div>
+<div class="card"><h3>Cash Cup &amp; Giveaway du dimanche</h3><p>Organisés manuellement : le gagnant de la Cash Cup reçoit 10 points (×3 si Premium). Le Giveaway (compte vérifié requis) donne jusqu’à 50 points au 1er, 25 points au 2e. Les gains sont crédités par l’administration.</p></div>
+<div id="shm" class="meta"></div></section>
+<section id="mm" class="tab"><div class="row"><input id="mmn" placeholder="Ton pseudo chess.com (pour l’Elo)"><button class="b" id="mmb">Trouver un adversaire</button><button class="b" id="mmx">Annuler</button><button class="b" id="mmr" style="display:none">Abandonner</button><span id="mms" class="meta"></span></div>
+<div class="grid" style="margin-top:20px"><div style="width:min(92vw,500px)"><div id="mbd"></div></div><div class="card"><b id="mmi">—</b><div id="mmj" class="meta"></div></div></div></section>
+<section id="ch" class="tab"><h2 class="hd">Coach</h2><p class="lead">Discute librement avec ton coach : il connaît (si tu l’autorises) ton Elo, tes parties analysées, tes erreurs récurrentes et ta to-do pour te répondre de façon personnalisée.</p>
+<div class="row"><label><input type="checkbox" id="chx" checked> Autoriser le coach à utiliser mes données (parties, Elo, stats, to-do)</label><button class="b" id="chc">Vider la conversation</button></div>
+<div id="chl" class="card" style="min-height:260px;max-height:50vh;overflow:auto"></div>
+<div class="row" style="margin-top:10px"><textarea id="chi" rows="2" style="flex:1" placeholder="Pose une question, ex. « pourquoi d5 est mieux que e5 ici ? » ou « analyse ma partie 3 »…"></textarea><button class="b" id="chs">Envoyer</button></div></section>
+<section id="lb" class="tab"><div class="card" id="gold">🏆 <b>Golden Sunday</b> — chaque dimanche, le n°1 du classement reçoit une semaine de Premium offerte. <span id="goldm" class="meta"></span></div><div class="card row"><select id="lbk"><option value="blitz">Blitz</option><option value="rapid">Rapide</option><option value="bullet">Bullet</option></select><select id="lbf"><option value="all">Toutes plateformes</option><option value="chesscom">Chess.com</option><option value="lichess">Lichess</option></select><input id="lbn" placeholder="Pseudo"><select id="lbp"><option value="chesscom">Chess.com</option><option value="lichess">Lichess</option></select><button class="b" id="lba">Rejoindre le classement</button><button class="b" id="lbr">↻</button><span id="lbm"></span></div><div class="card"><table style="width:100%;border-collapse:collapse"><tbody id="lbt"></tbody></table></div></section>
+<section id="ia" class="tab"><div class="card"><p>Les fournisseurs sont essayés dans l’ordre (↑↓). Sur une limite de requêtes (429), le fournisseur est suspendu jusqu’à la réinitialisation quotidienne (10 min si la limite est temporaire) puis le suivant prend le relais. Mode Turbo : Groq en premier.</p><div class="row"><button class="b" onclick="addP('OpenRouter','https://openrouter.ai/api/v1')">+ OpenRouter</button><button class="b" onclick="addP('Groq','https://api.groq.com/openai/v1')">+ Groq</button><button class="b" onclick="addP('Autre','')">+ Autre (compatible OpenAI)</button></div></div><div id="pl"></div></section>
+<section id="to" class="tab"><div class="card"><h3>Calculateur Elo</h3><div class="row"><select id="es"><option value="fide">FIDE</option><option value="lichess">Lichess (Glicko-2 approx.)</option><option value="cc">Chess.com (Glicko approx.)</option></select>
+<input id="e1" type="number" placeholder="Ton Elo" value="1200"><input id="e2" type="number" placeholder="Elo adversaire" value="1300"><select id="er"><option value="1">Victoire</option><option value="0.5">Nulle</option><option value="0">Défaite</option></select>
+<input id="ek" type="number" value="20" title="K (FIDE) ou RD (Glicko)" style="width:90px"><button class="b" id="eg">Calculer</button></div><p><small>Champ à droite : K pour FIDE (40/20/10), RD pour Glicko (défaut ≈ 75).</small></p><h2 id="eo"></h2></div></section>
+<section id="cf" class="tab"><h2 class="hd">Confidentialité</h2>
+<div class="card"><h3>Stocké uniquement sur ton appareil</h3><p>Tes réglages, ta to-do, ton historique de chat avec le coach et les parties importées restent dans le stockage local de ton navigateur (localStorage). Rien de tout cela n’est envoyé à un serveur, sauf si tu utilises explicitement le compte en ligne (ci-dessous).</p></div>
+<div class="card"><h3>Compte en ligne (optionnel)</h3><p>Si tu crées un compte, ton pseudo, un hachage (jamais le mot de passe en clair) et les données que tu choisis de sauvegarder sont stockés dans le Cloudflare KV du Worker. Les clés de tes fournisseurs IA ne sont jamais envoyées ni sauvegardées sur le Worker.</p></div>
+<div class="card"><h3>Vérification de compte chess.com / Lichess</h3><p>La vérification lit uniquement les champs publics de ton profil (bio ou localisation) pour y chercher le code temporaire que tu y as collé. Aucune donnée privée n’est demandée ni stockée au-delà du pseudo et de la plateforme liée.</p></div>
+<div class="card"><h3>Fournisseurs IA</h3><p>Quand tu utilises l’analyse, les commentaires ou le chat, le texte nécessaire (position, contexte que tu autorises) est envoyé au fournisseur IA que tu as configuré (OpenRouter, Groq, ou un autre, avec ta propre clé). Ce site n’a aucun contrôle sur ce que ces fournisseurs font de ces requêtes : consulte leurs propres politiques.</p></div>
+<div class="card"><h3>Classement et 1v1</h3><p>Si tu rejoins le classement ou le 1v1, ton pseudo et tes statistiques publiques chess.com/Lichess deviennent visibles par les autres utilisateurs du site. Le matchmaking 1v1 utilise une connexion directe entre les deux navigateurs (pair à pair) : le Worker ne voit que l’échange initial de connexion, pas la partie elle-même.</p></div>
+<div class="card"><h3>Aucune publicité, aucun traqueur</h3><p>Ce site ne contient aucun service de publicité ni d’analytics tiers. Les seules requêtes externes sont celles décrites ci-dessus.</p></div>
+<div class="card"><h3>Suppression de tes données</h3><p>Tu peux à tout moment vider le stockage local depuis les réglages de ton navigateur, ou nous contacter pour supprimer ton compte en ligne et les données associées.</p></div></section>
+<section id="tu" class="tab"><div class="card"><h3>Créer une clé OpenRouter (gratuit)</h3><ol><li>Va sur <a href="https://openrouter.ai" target="_blank">openrouter.ai</a> et crée un compte.</li><li>Menu <b>Keys</b> → <b>Create Key</b>, copie la clé (sk-or-…).</li><li>Ouvre l’onglet <b>Fournisseurs IA</b>, colle la clé dans la ligne OpenRouter puis clique « ↻ Modèles » et choisis un modèle <code>:free</code>.</li><li>Ajoute d’autres fournisseurs (Groq, etc.) : ils servent de secours si une limite est atteinte.</li></ol><p>La clé reste dans ton navigateur et n’est envoyée qu’à OpenRouter.</p></div></section>
+<section id="pa" class="tab"><div class="card"><h3>Réglages</h3><div class="row"><label>Profondeur Stockfish <input id="cd" type="number" min="6" max="20" style="width:70px"></label><label>Nb parties importées <input id="cn" type="number" min="1" max="50" style="width:70px"></label><label>Ton pseudo <input id="cu"></label><label>Ton Elo <input id="ce" type="number" style="width:80px"></label><label>Commentaires pré-générés (coups) <input id="cp" type="number" min="0" max="10" style="width:70px"></label><label>Thème <select id="cth"><option value="vert">Vert</option><option value="bois">Bois</option><option value="bleu">Bleu</option><option value="nuit">Nuit</option></select></label><label>Coordonnées <select id="cco"><option value="1">Afficher</option><option value="0">Masquer</option></select></label><label>Sons <select id="csx"><option value="1">Activés</option><option value="0">Coupés</option></select></label><label>Mode dynamique <select id="cdy"><option value="0">Non</option><option value="1">Oui</option></select></label><label>Commentaires automatiques <select id="cac"><option value="1">Générer automatiquement</option><option value="0">Manuel (bouton)</option></select></label></div><button class="b" id="cs" style="margin-top:8px">Enregistrer</button></div>
+<div class="card"><h3>Données</h3><button class="b" id="xp">Exporter JSON</button> <input type="file" id="xi" accept=".json"></div>
+</section>
+</main>
+<script>
+const $=i=>document.getElementById(i),S={games:[],g:null,ply:0,flip:false};
+let st={};try{st=JSON.parse(localStorage.ea||'{}')}catch(e){}
+const cfg=Object.assign({key:'',gk:'',model:'openrouter/free',model2:'openrouter/free',d:12,n:10,me:'',worker:'https://chess.peppapigguez.workers.dev',elo:1200,pre:2,theme:'vert',sfx:'1',dyn:'0',coords:'1',autoc:'1'},st.cfg),todo=st.todo||[];
+const save=()=>{try{localStorage.ea=JSON.stringify({cfg,todo,chat:st.chat||[]})}catch(e){}};
+document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>{document.querySelectorAll('nav button,.tab').forEach(x=>x.classList.remove('on'));b.classList.add('on');$(b.dataset.t).classList.add('on')});
+/* ---- réglages ---- */
+if(!cfg.mig){cfg.model='openrouter/free';cfg.mig=1}document.body.dataset.th=cfg.theme;
+if(!cfg.provs){cfg.provs=[{name:'OpenRouter',url:'https://openrouter.ai/api/v1',key:cfg.key||'',model:cfg.model||'openrouter/free',light:cfg.model2||'openrouter/free',models:[],until:0}];if(cfg.gk)cfg.provs.push({name:'Groq',url:'https://api.groq.com/openai/v1',key:cfg.gk,model:'llama-3.3-70b-versatile',light:'llama-3.1-8b-instant',models:[],until:0})}
+const F={cd:'d',cn:'n',cu:'me',ce:'elo',cp:'pre',cth:'theme',csx:'sfx',cdy:'dyn',cco:'coords',cac:'autoc'};
+for(const k in F)$(k).value=cfg[F[k]];
+$('cs').onclick=()=>{for(const k in F)cfg[F[k]]=$(k).type=='number'?+$(k).value:$(k).value.trim();save();document.body.dataset.th=cfg.theme;alert('Enregistré')};
+const dl=(n,t,m)=>{const a=document.createElement('a');a.href=m?t:URL.createObjectURL(new Blob([t]));a.download=n;a.click()};
+$('xp').onclick=()=>dl('echecs.json',JSON.stringify({cfg,todo}));
+$('xi').onchange=async e=>{const d=JSON.parse(await e.target.files[0].text());Object.assign(cfg,d.cfg);todo.splice(0,todo.length,...(d.todo||[]));save();location.reload()};
+/* ---- compte ---- */
+let AU=null,ME=null;try{AU=JSON.parse(localStorage.eaS||'null')}catch(e){}
+const hh=async(u,p)=>[...new Uint8Array(await crypto.subtle.digest('SHA-256',new TextEncoder().encode(u+':'+p)))].map(x=>x.toString(16).padStart(2,'0')).join('');
+async function api(op,b){const w=(cfg.worker||'').replace(/\/+$/,'');if(!w)return{error:'URL du Worker manquante (Paramètres)'};try{return await(await fetch(w+'/'+op,{method:'POST',body:JSON.stringify({...(AU||{}),...b})})).json()}catch(e){return{error:e.message}}}
+function acui(){const p=ME&&ME.prem>Date.now();$('acs').innerHTML=AU&&ME?`<b>${esc(AU.u)}</b> · ${p?'Premium jusqu’au '+new Date(ME.prem).toLocaleDateString():'Gratuit'}<br>Comptes vérifiés : ${ME.links.map(x=>esc(x.n)+' ('+(x.p=='lichess'?'Lichess':'Chess.com')+')').join(', ')||'aucun'}`:'Non connecté';$('adm').style.display=ME&&ME.admin?'':'none';
+ $('navbal').textContent=ME?`💎 ${ME.pts} pt · 🎟 ${ME.tokens} token(s)`:'';
+ $('shbal').textContent=ME?`💎 ${ME.pts} points · 🎟 ${ME.tokens} token(s) IA restants · ${p?'Premium actif jusqu’au '+new Date(ME.prem).toLocaleDateString():'Compte gratuit'}`:'';
+ const CP=[[1,1],[2,2],[5,7],[10,15]];
+ if($('shcp'))$('shcp').innerHTML=CP.map(([t,pt])=>`<div class="row" style="margin:6px 0"><b>${t} checkpoint${t>1?'s':''}</b><span>(${pt} pt${pt>1?'s':''} de base)</span><button class="b" onclick="pbLink(${t})">Obtenir le lien</button><input id="pbk${t}" placeholder="Colle ta clé PlatoBoost"><button class="b" onclick="pbClaim(${t})">Valider</button></div>`).join('')}
+async function refresh(){if(!AU)return acui();const r=await api('me');if(r.error){$('am').textContent=r.error;if(/incorrect|introuvable/i.test(r.error)){AU=null;localStorage.eaS='null'}ME=null}else{ME=r;localStorage.eaS=JSON.stringify(AU);$('am').textContent=''}acui()}
+async function login(reg){const u=$('au').value.trim(),p=$('ap').value;if(!u||!p)return;AU={u,h:await hh(u,p)};if(reg){const r=await api('reg');if(r.error){AU=null;return $('am').textContent=r.error}}await refresh()}
+async function need(f){if(!AU||!ME){alert('Connecte-toi (onglet Compte) pour utiliser cette fonction.');document.querySelector('[data-t=ac]').click();return false}
+ if(f){const r=await api('use',{f});if(!r.ok){alert(r.error||'Limite gratuite du jour atteinte : passe en Premium.');document.querySelector('[data-t=pr]').click();return false}}return true}
+async function acc(op){if(!AU)return $('am').textContent='Connecte-toi d’abord';const c={...cfg,key:'',gk:'',provs:cfg.provs.map(x=>({...x,key:'',models:[]}))};
+ const j=await api(op,op=='save'?{data:{cfg:c,todo}}:{});if(op=='load'&&j.data){if(!j.data.cfg)return $('am').textContent='Rien de sauvegardé';const old=cfg.provs;Object.assign(cfg,j.data.cfg);cfg.provs.forEach(x=>{const o=old.find(y=>y.url==x.url&&y.name==x.name);x.key=o?o.key:''});todo.splice(0,todo.length,...(j.data.todo||[]));save();location.reload()}$('am').textContent=j.msg||j.error}
+$('ag').onclick=()=>login(0);
+$('fp').onclick=()=>{$('fpb').style.display=$('fpb').style.display=='none'?'':'none'};
+$('fp1').onclick=async()=>{const u=$('fpu').value.trim();if(!u)return;$('fpm').textContent='…';const r=await fetch((cfg.worker||'').replace(/\/+$/,'')+'/reset/start',{method:'POST',body:JSON.stringify({u})}).then(x=>x.json()).catch(e=>({error:e.message}));
+ $('fpm').innerHTML=r.error||`Compte lié : <b>${esc(r.p=='lichess'?'Lichess':'Chess.com')} — ${esc(r.n)}</b>. Place ce code dans ${r.p=='lichess'?'ta <b>bio Lichess</b>':'le champ <b>Localisation</b> de ton profil chess.com'} : <b>${r.code}</b>, choisis un nouveau mot de passe ci-dessous puis clique « Vérifier et réinitialiser ».`};
+$('fp2').onclick=async()=>{const u=$('fpu').value.trim(),np=$('fpn').value;if(!u||!np)return;$('fpm').textContent='…';const nh=await hh(u,np);
+ const r=await fetch((cfg.worker||'').replace(/\/+$/,'')+'/reset/check',{method:'POST',body:JSON.stringify({u,nh})}).then(x=>x.json()).catch(e=>({error:e.message}));
+ $('fpm').textContent=r.msg||r.error;if(r.msg){$('au').value=u;$('ap').value=np;$('fpb').style.display='none'}};
+$('agr').onclick=()=>login(1);$('as').onclick=()=>acc('save');$('al').onclick=()=>acc('load');$('ao').onclick=()=>{AU=null;ME=null;localStorage.eaS='null';acui()};
+if(AU)$('au').value=AU.u;
+$('lvo').onclick=()=>{const n=$('lvn').value.trim();window.open($('lvp').value=='lichess'?('https://lichess.org/@/'+encodeURIComponent(n||'')):'https://www.chess.com/settings/profile','_blank')};
+$('lv1').onclick=async()=>{if(!await need())return;const r=await api('link/start',{p:$('lvp').value,n:$('lvn').value.trim()});$('lvm').innerHTML=r.error||`Place ce code dans ${$('lvp').value=='lichess'?'ta <b>bio Lichess</b>':'le champ <b>Localisation</b> de ton profil chess.com'} : <b>${r.code}</b>, puis clique « Vérifier ». Tu pourras le retirer ensuite.`};
+$('lv2').onclick=async()=>{const r=await api('link/check');$('lvm').textContent=r.msg||r.error;if(r.links){ME.links=r.links;acui()}};
+$('cdb').onclick=async()=>{if(!await need())return;const r=await api('redeem',{code:$('cdc').value});$('cdm').textContent=r.msg||r.error;if(r.prem){ME.prem=r.prem;acui()}};
+$('adb').onclick=async()=>{const r=await api('admin/gen',{days:+$('add').value,n:+$('adn').value});$('ado').value=r.codes?r.codes.join('\n'):r.error};
+async function pbLink(t){if(!await need())return;$('shm').textContent='…';const r=await api('shop/pb_link',{tier:t});if(r.url){window.open(r.url,'_blank');$('shm').textContent='Lien ouvert — complète le palier puis colle la clé reçue ici.'}else $('shm').textContent=r.error};
+async function pbClaim(t){if(!await need())return;const key=$('pbk'+t).value.trim();if(!key)return;$('shm').textContent='…';const r=await api('shop/pb_claim',{tier:t,key});$('shm').textContent=r.msg||r.error;if(r.pts!=null){ME.pts=r.pts;acui()}};
+$('shtb').onclick=async()=>{if(!await need())return;const n=+$('shtn').value||0;$('shm').textContent='…';const r=await api('shop/buy_tokens',{n});$('shm').textContent=r.msg||r.error;if(r.pts!=null){ME.pts=r.pts;ME.tokens=r.tokens;acui()}};
+async function buyPrem(days){if(!await need())return;$('shm').textContent='…';const r=await api('shop/buy_premium',{days});$('shm').textContent=r.msg||r.error;if(r.pts!=null){ME.pts=r.pts;ME.prem=r.prem;acui()}};
+$('awb').onclick=async()=>{const r=await api('admin/award_points',{u:$('awu').value.trim(),pts:+$('awp').value,reason:$('awr').value.trim()});$('awm').textContent=r.msg||r.error};
+/* ---- IA ---- */
+const esc=s=>String(s==null?'':s).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;');
+const resetT=j=>{const h=j.error&&j.error.metadata&&j.error.metadata.headers,r=h&&+h['X-RateLimit-Reset'];return r>Date.now()?r:new Date(new Date().setUTCHours(24,0,0,0)).getTime()};
+async function callLLM(messages,mode){mode=mode||$('im').value;
+ const premium=ME&&ME.prem>Date.now(),ownKey=cfg.provs.some(x=>x.url&&x.key);
+ if(!premium||!ownKey){if(!await need())return'Connecte-toi (onglet Compte) pour utiliser l’IA.';
+  const r=await api('ai/call',{messages,mode});
+  if(r.text){ME.tokens=r.tokensLeft;try{acui()}catch(e){}return r.text}
+  return'Erreur : '+(r.error||'tokens épuisés — voir la Boutique')}
+ const isG=x=>/groq/i.test(x.url);let L=cfg.provs.filter(x=>x.url&&x.until<=Date.now()&&(x.key||!/openrouter|groq/i.test(x.url)));
+ L=[...L.filter(x=>mode=='turbo'?isG(x):!isG(x)),...L.filter(x=>mode=='turbo'?!isG(x):isG(x))];
+ if(!L.length)return'Aucun fournisseur IA disponible (clé manquante ou tous suspendus) : voir l’onglet Fournisseurs IA.';let last='';
+ const isGuard=t=>t&&/^\s*(user safety|response safety|safe|unsafe)\s*[:\n]/i.test(t);
+ for(const x of L){try{const m=mode=='full'?x.model:(x.light||x.model),h={'Content-Type':'application/json'};if(x.key)h.Authorization='Bearer '+x.key;
+  let r=await fetch(x.url.replace(/\/+$/,'')+'/chat/completions',{method:'POST',headers:h,body:JSON.stringify({model:m,messages})});
+  let j=await r.json().catch(()=>({})),tx=j.choices&&j.choices[0]&&j.choices[0].message&&j.choices[0].message.content;
+  if(isGuard(tx)&&/openrouter\/free$/.test(m)){r=await fetch(x.url.replace(/\/+$/,'')+'/chat/completions',{method:'POST',headers:h,body:JSON.stringify({model:m,messages})});j=await r.json().catch(()=>({}));tx=j.choices&&j.choices[0]&&j.choices[0].message&&j.choices[0].message.content}
+  if(tx&&!isGuard(tx))return tx;
+  if(tx){last=x.name+' : a renvoyé une réponse de modération au lieu d’une réponse (modèle non adapté)';continue}
+  const er=JSON.stringify(j.error||j);last=x.name+' : '+er;if(r.status==429||(j.error&&j.error.code==429)||/rate limit/i.test(er)){x.until=/per-day|daily|day/i.test(er)?resetT(j):Date.now()+6e5;save();rp()}}catch(e){last=x.name+' : '+e.message}}
+ return'Erreur : '+last}
+async function ai(p,mode,long){return callLLM([{role:'system',content:long?'Tu es un coach d’échecs. Français, structuré, concis.':'Coach d’échecs. Français. Réponse TRÈS brève : 1 à 2 phrases (max 35 mots), directe, seulement l’essentiel.'},{role:'user',content:p}],mode)}
+/* ---- Stockfish local ---- */
+let sf,q=Promise.resolve();
+const ev=(fen,d)=>q=q.then(()=>new Promise(res=>{const c=new Chess(fen),t=fen.split(' ')[1]=='w'?1:-1;
+ if(c.game_over())return res({cp:c.in_checkmate()?-10000*t:0,best:'',pv:[]});
+ sf=sf||new Worker(URL.createObjectURL(new Blob(["importScripts('https://cdnjs.cloudflare.com/ajax/libs/stockfish.js/10.0.2/stockfish.js')"])));
+ let s=0,pv=[];sf.onmessage=e=>{const l=String(e.data),m=l.match(/score (cp|mate) (-?\d+)/);
+ if(m&&!/bound/.test(l)){const v=+m[2];s=m[1]=='cp'?v:(v>0?1:-1)*(10000-Math.abs(v)*10);const pm=l.match(/ pv (.+)/);if(pm)pv=pm[1].split(' ').slice(0,6)}
+ if(l.startsWith('bestmove'))res({cp:s*t,best:l.split(' ')[1],pv})};
+ sf.postMessage('position fen '+fen);sf.postMessage('go depth '+d)}));
+/* ---- classification ---- */
+const wp=c=>50+50*(2/(1+Math.exp(-.00368208*c))-1),cl=x=>Math.max(-1000,Math.min(1000,x)),PV={p:1,n:3,b:3,r:5,q:9};
+const L={brillant:'#1baca6',meilleur:'#96bc4b',excellent:'#7fb069',bon:'#a3b18a',acceptable:'#c9b458',imprécision:'#f7c631',mauvais:'#e58f2a',erreur:'#e0662a',gaffe:'#ca3431'};
+function classify(g){let cands=OP.map((o,oi)=>({oi,seq:o[1].split(' ')}));
+ g.res=g.moves.map((m,i)=>{const w=m.color=='w'?1:-1,a=g.ev[i].cp*w,b=g.ev[i+1].cp*w,loss=Math.max(0,wp(a)-wp(b)),cpl=Math.max(0,cl(a)-cl(b)),
+ uci=m.from+m.to+(m.promotion||''),best=uci==g.ev[i].best,beforeWP=wp(a),afterWP=wp(b);
+ let k=best?'meilleur':loss<1?'excellent':loss<3?'bon':loss<6?'acceptable':loss<10?'imprécision':loss<15?'mauvais':loss<25?'erreur':'gaffe';
+ // Coup brillant (définition stricte) : sacrifice volontaire confirmé par la réponse de l'adversaire, position pas déjà totalement gagnée avant, pas mauvaise après.
+ if((best||loss<2)&&PV[m.piece]>=3&&beforeWP<94&&afterWP>=35){const nb=g.ev[i+1]&&g.ev[i+1].best;
+  if(nb){const c=new Chess(g.fens[i+1]),cap=c.moves({verbose:true}).find(x=>x.from==nb.slice(0,2)&&x.to==nb.slice(2,4));
+   if(cap&&cap.to==m.to&&cap.captured&&PV[cap.captured]>=PV[m.piece]-1)k='brillant'}}
+ // Coup théorique : fait encore partie d'une ligne d'ouverture connue (OP), jouée coup pour coup.
+ let book=null;if(cands.length){cands=cands.filter(c=>c.seq[i]===m.san);if(cands.length){const lg=cands.reduce((x,y)=>y.seq.length>x.seq.length?y:x);book={name:OP[lg.oi][0],note:OP[lg.oi][2]}}}
+ const n=(g.fens[i].split(' ')[0].match(/[nbrqNBRQ]/g)||[]).length;
+ return{k,loss,cpl,acc:Math.max(0,Math.min(100,103.17*Math.exp(-.04354*loss)-3.17)),best,book,ph:i<20?'Ouverture':n<=6?'Finale':'Milieu',w:m.color}})}
+function setBar(id,cpWhite){const el=document.getElementById(id);if(!el)return;const w=cpWhite==null?50:Math.max(2,Math.min(98,wp(cpWhite)));
+ const board=el.nextElementSibling;if(board){const h=board.getBoundingClientRect().height;if(h>4)el.style.height=h+'px'}
+ const fill=el.firstElementChild;if(fill)fill.style.height=w+'%'}
+addEventListener('resize',()=>{setBar('ebar',S.g&&S.g.ev&&S.g.ev[S.ply]?S.g.ev[S.ply].cp:(S.v?S.vcp:null));if(Y)setBar('jbar',Y.cp)});
+const lvl=(l,b)=>b?'meilleur':l<1?'excellent':l<3?'bon':l<6?'acceptable':l<10?'imprécision':l<15?'mauvais':l<25?'erreur':'gaffe',fmt=c=>Math.abs(c)>9000?'Mat':(c>0?'+':'')+(c/100).toFixed(2),NM={p:'pion',n:'cavalier',b:'fou',r:'tour',q:'dame'};
+async function analyze(g,cb,d){if(g.res)return;g.ev=[];g.dp=[];for(let i=0;i<g.fens.length;i++){g.ev.push(await ev(g.fens[i],d||cfg.d));g.dp.push(d||cfg.d);cb&&cb(i+1,g.fens.length)}classify(g)}
+function ctx(g,i){const m=g.moves[i],r=g.res[i],E=g.ev,w=m.color=='w'?1:-1,o=[],u=E[i].best;
+ if(E[i].cp*w>=9000&&r.k!='meilleur')o.push('il avait un mat forcé');
+ if(u&&!r.best){const c=new Chess(g.fens[i]),bm=c.move({from:u.slice(0,2),to:u.slice(2,4),promotion:u[4]});if(bm){const tg=[];if(bm.captured)tg.push('capture');if(/[+#]/.test(bm.san))tg.push('échec');
+  const f=c.fen().split(' ');f[1]=f[1]=='w'?'b':'w';f[3]='-';let n=0;try{n=new Chess(f.join(' ')).moves({verbose:true}).filter(x=>x.from==bm.to&&x.captured&&PV[x.captured]>=3&&PV[x.captured]>=PV[bm.piece]).length}catch(e){}if(n>=2)tg.push('fourchette');
+  o.push(`le meilleur coup ${bm.san} (${tg.join(', ')||'positionnel'})`)}}
+ const nx=E[i+1]&&E[i+1].best;if(nx){const c=new Chess(g.fens[i+1]),rp=c.move({from:nx.slice(0,2),to:nx.slice(2,4),promotion:nx[4]});if(rp&&(rp.captured||/[+#]/.test(rp.san)))o.push(`l’adversaire répond ${rp.san}${rp.captured?' en prenant '+NM[rp.captured]:''}`)}
+ const k=g.clk;if(k&&k[i]!=null){const sp=i>=2&&k[i-2]!=null?Math.max(0,k[i-2]-k[i]):null;o.push(`temps restant ${Math.round(k[i])}s${sp!=null?', '+Math.round(sp)+'s passées sur ce coup':''}`)}
+ o.push(`éval ${(E[i].cp*w/100).toFixed(1)} → ${(E[i+1].cp*w/100).toFixed(1)}`);return o.join(' ; ')}
+/* ---- import ---- */
+function add(pgns){let n=0;for(const p of pgns){if(S.games.some(g=>g.pgn==p))continue;const c=new Chess();if(!c.load_pgn(p))continue;const h=c.header(),r=new Chess(),fens=[r.fen()],moves=c.history({verbose:true});
+ for(const m of moves){r.move(m.san);fens.push(r.fen())}if(!moves.length)continue;
+ S.games.push({pgn:p,h,moves,fens,clk:[...p.matchAll(/\[%clk (\d+):(\d+):(\d+(?:\.\d+)?)\]/g)].map(x=>+x[1]*3600+ +x[2]*60+ +x[3]),label:`${h.White} vs ${h.Black} (${h.Result}) ${h.Date||''}`});n++}
+ $('gs').innerHTML=S.games.map((g,i)=>`<option value="${i}">${g.label}</option>`).join('');if(S.games.length&&!S.g)pick(0);return n}
+const sp=t=>t.split(/\n\n(?=\[Event )/).filter(x=>x.trim());
+$('imp').onclick=async()=>{const u=$('usr').value.trim();if(!u)return;$('ist').textContent='Import…';cfg.me=u;$('cu').value=u;save();
+ try{let p=[];if($('src').value=='lichess')p=sp(await(await fetch(`https://lichess.org/api/games/user/${u}?max=${cfg.n}`,{headers:{Accept:'application/x-chess-pgn'}})).text());
+ else{const a=(await(await fetch(`https://api.chess.com/pub/player/${u}/games/archives`)).json()).archives.reverse();for(const x of a){p.push(...(await(await fetch(x)).json()).games.reverse().map(g=>g.pgn));if(p.length>=cfg.n)break}p=p.slice(0,cfg.n)}
+ $('ist').textContent=add(p)+' parties ajoutées'}catch(e){$('ist').textContent='Erreur : '+e.message}};
+$('fil').onchange=async e=>{let n=0;for(const f of e.target.files)n+=add(sp(await f.text()));$('ist').textContent=n+' parties ajoutées'};
+$('gs').onchange=e=>pick(+e.target.value);
+async function pick(i){const g=S.g=S.games[i];S.ply=0;S.v=null;S.tok=(S.tok||0)+1;const tk=S.tok,dy=cfg.dyn=='1';rend();
+ if(!g.res){$('pg').textContent='Stockfish…';await analyze(g,(a,b)=>$('pg').textContent=`Analyse ${a}/${b}`,dy?6:cfg.d);$('pg').textContent='';rend()}
+ if(dy)dynLoop(g,tk)}
+async function dynLoop(g,tk){const M=Math.max(cfg.d,16);while(S.tok==tk&&g.res){const p=S.ply;let b=-1,bs=1e9;
+ g.fens.forEach((f,i)=>{if(g.dp[i]>=M)return;const s=(i>=p-1&&i<=p+2?0:100)+g.dp[i]+Math.abs(i-p)*.01;if(s<bs){bs=s;b=i}});
+ if(b<0){$('pg').textContent='';break}$('pg').textContent=`Affinage… (profondeur ${g.dp[b]+2})`;const e=await ev(g.fens[b],g.dp[b]+2);if(S.tok!=tk)break;g.ev[b]=e;g.dp[b]+=2;classify(g);if(b>=S.ply-1&&b<=S.ply+2&&!S.v)rend()}}
+/* ---- échiquier ---- */
+const U={k:'♚',q:'♛',r:'♜',b:'♝',n:'♞',p:'♟'},cen=(s,f)=>[f?7-s.charCodeAt(0)+97:s.charCodeAt(0)-97,f?s[1]-1:8-s[1]];
+function arrow(u,col,fl=S.flip){if(!u)return'';const[a,b]=cen(u.slice(0,2),fl),[c,d]=cen(u.slice(2,4),fl);return`<line x1="${a+.5}" y1="${b+.5}" x2="${c+.5}" y2="${d+.5}" stroke="${col}" stroke-width=".18" stroke-linecap="round" opacity=".85"/><circle cx="${c+.5}" cy="${d+.5}" r=".22" fill="${col}" opacity=".85"/>`}
+const sans=(fen,u)=>{const c=new Chess(fen),m=c.move({from:u.slice(0,2),to:u.slice(2,4),promotion:u[4]});return m?m.san:u};
+let AC;const SFX={mv:'boismove.mp3',cap:'boisprise.mp3',chk:'bois echecs.mp3',mat:'mat.mp3'};
+function synth(t){try{AC=AC||new AudioContext();const o=AC.createOscillator(),g=AC.createGain(),f={mv:[300,.07],cap:[170,.13],chk:[540,.16],err:[110,.28],win:[880,.45],mat:[200,.6]}[t]||[300,.07];o.frequency.value=f[0];if(t=='mat'){o.frequency.setValueAtTime(420,AC.currentTime);o.frequency.exponentialRampToValueAtTime(90,AC.currentTime+f[1])}o.type=t=='cap'?'square':'triangle';g.gain.setValueAtTime(.12,AC.currentTime);g.gain.exponentialRampToValueAtTime(.001,AC.currentTime+f[1]);o.connect(g);g.connect(AC.destination);o.start();o.stop(AC.currentTime+f[1])}catch(e){}}
+const AP={};
+function snd(t){if(cfg.sfx=='0')return;const f=SFX[t];if(!f)return synth(t);try{let a=AP[t];if(!a){a=new Audio(encodeURI(f));a.preload='auto';a.volume=.65;AP[t]=a}a.pause();a.currentTime=0;const pl=a.play();if(pl&&pl.catch)pl.catch(()=>synth(t))}catch(e){synth(t)}}
+function mateFX(c,sel,key){if(!c.in_checkmate())return;if(S.lastMateKey===key)return;S.lastMateKey=key;const col=c.turn(),b=c.board();let ksq=null;
+ for(let r=0;r<8;r++)for(let cc=0;cc<8;cc++){const s=b[r][cc];if(s&&s.type=='k'&&s.color==col)ksq='abcdefgh'[cc]+(8-r)}
+ if(ksq)setTimeout(()=>{const el=document.querySelector(sel+' .sq[data-sq="'+ksq+'"]');if(el)el.classList.add('mateKing')},30);snd('mat')}
+const co=(x,y,r,c)=>cfg.coords=='0'?'':(x==0?`<i class="co r">${8-r}</i>`:'')+(y==7?`<i class="co f">${'abcdefgh'[c]}</i>`:'');
+function moveSnd(mv){if(!mv||/#/.test(mv.san))return;snd(/\+/.test(mv.san)?'chk':mv.captured?'cap':'mv')}
+function bh(c,f,sel,hl,cb){const b=c.board(),lg=sel?c.moves({square:sel,verbose:true}).map(m=>m.to):[];let h='';for(let y=0;y<8;y++)for(let x=0;x<8;x++){const r=f?7-y:y,cc=f?7-x:x,s=b[r][cc],sq='abcdefgh'[cc]+(8-r);
+ h+=`<div class="sq ${(r+cc)%2?'k':'w'} ${sel==sq?'sl':''} ${lg.includes(sq)?'lg':''} ${hl.includes(sq)?'hl':''}" data-sq="${sq}" data-cb="${cb}"><span class="${s&&s.color=='w'?'pw':'pb'} ${hl[1]==sq?'pop':''}">${s?U[s.type]+'\uFE0E':'&nbsp;'}</span>${co(x,y,r,cc)}</div>`}return h}
+const gq={p:Promise.resolve()};
+function gen(g,p,force){g.cm=g.cm||{};g.pend=g.pend||{};if(g.cm[p]&&!force)return Promise.resolve(g.cm[p]);if(g.pend[p]&&!force)return g.pend[p];const i=p-1;if(!g.res||!g.res[i])return Promise.resolve('');
+ const pr=gq.p.then(async()=>{const m=g.moves[i],r=g.res[i],bu=g.ev[i].best,bs=bu&&!r.best?sans(g.fens[i],bu):'';
+  const t=await ai(`Coup ${m.san} des ${m.color=='w'?'Blancs':'Noirs'}, jugé « ${r.k} » (perte ${r.cpl} cp). ${bs?'Meilleur coup : '+bs+'. ':''}Contexte : ${ctx(g,i)}. Explique en 1-2 phrases courtes ce que fait le coup et, si c’est une erreur, sa cause (menace non vue, tactique manquée, manque de temps…).`);
+  delete g.pend[p];if(!/^(Erreur|Clé|Aucun)/.test(t))g.cm[p]=t;return t});gq.p=pr.catch(()=>{});g.pend[p]=pr;return pr}
+function go(p){S.ply=p;S.v=null;S.sel=null;const m=S.g&&S.g.moves[p-1];if(m&&!/#/.test(m.san))snd(/\+/.test(m.san)?'chk':m.captured?'cap':'mv');rend()}
+const KEY=['brillant','gaffe','erreur','mauvais','imprécision'];
+function nav(d){const g=S.g;if(!g)return;let p=S.ply+d;if($('acc').checked&&g.res)while(p>0&&p<=g.moves.length&&!KEY.includes(g.res[p-1].k))p+=d;go(Math.max(0,Math.min(g.moves.length,p)))}
+function rend(){const g=S.g;if(!g){const c=S.v||new Chess();$('bd').innerHTML=bh(c,S.flip,S.sel,[],'pa');$('ar').innerHTML='';setBar('ebar',S.v?S.vcp:null);return}const p=S.ply,v=S.v,m=g.moves[p-1],r=g.res&&g.res[p-1],bu=g.ev&&g.ev[p-1]&&g.ev[p-1].best,c=v||new Chess(g.fens[p]);
+ const forced=g.forceEval&&g.forceEval[p],book=!v&&r&&r.book&&!forced;
+ $('bd').innerHTML=bh(c,S.flip,S.sel,!v&&m?[m.from,m.to]:[],'pa');$('ar').innerHTML=!v&&r&&!r.best&&!book?arrow(bu,'#2e9e44'):'';mateFX(c,'#bd',c.fen()+':an');
+ $('evl').textContent=v?(S.ve||''):g.ev&&g.ev[p]?fmt(g.ev[p].cp):'';setBar('ebar',v?S.vcp:(g.ev&&g.ev[p]?g.ev[p].cp:null));
+ $('ml').innerHTML=g.moves.map((x,i)=>`${i%2?'':`<b>${i/2+1}.</b>`}<button class="mv ${i+1==p?'on':''}" onclick="go(${i+1})">${g.res?`<span class="dot" style="background:${L[g.res[i].k]}"></span>`:''}${x.san}</button>`).join('');
+ $('tx').style.display=$('bst').style.display=$('ca').style.display='none';$('bx').style.display='none';$('bx').textContent='';
+ if(v)return $('lv').innerHTML='<i>Variante libre — joue n’importe quel coup, Stockfish évalue.</i>';
+ if(!m)return $('lv').innerHTML='<i>Position initiale</i>';
+ if(!r)return $('lv').innerHTML=`<b>${m.san}</b> — analyse en cours…`;
+ if(book){$('lv').innerHTML=`📖 <b style="font-size:1.2em">${m.san} — coup théorique</b><br>Fait partie de la ligne « <b>${esc(r.book.name)}</b> ». Pas d’évaluation détaillée par défaut sur un coup de théorie : c’est un coup préparé à l’avance, pas réfléchi sur le moment.<div class="bub" style="margin-top:8px">${esc(r.book.note)}</div><button class="b" id="bkf" style="margin-top:8px">Afficher quand même l’évaluation Stockfish</button>`;
+  $('bkf').onclick=()=>{g.forceEval=g.forceEval||{};g.forceEval[p]=true;rend()};return}
+ const bs=bu&&!r.best?sans(g.fens[p-1],bu):'';
+ $('lv').innerHTML=`<span class="dot" style="background:${L[r.k]}"></span><b style="font-size:1.2em">${m.san} — ${r.k}</b><br>Perte : ${r.cpl} cp · Précision : ${r.acc.toFixed(0)}%${bs?`<br>Meilleur : <b>${bs}</b>`:''}`;
+ if(bs){$('bst').style.display='';$('bm').textContent=bs}
+ const cached=g.cm&&g.cm[p];const acc=$('acc').checked;
+ if(cached){$('tx').style.display='';$('tx').textContent=cached;$('ca').style.display='';$('ca').textContent='🔄 Régénérer le commentaire'}
+ else if(!acc&&cfg.autoc=='1'){$('tx').style.display='';$('tx').textContent='…';gen(g,p).then(t=>{if(S.g==g&&S.ply==p&&!S.v&&t){$('tx').textContent=t;$('ca').style.display=g.cm[p]?'':'none';$('ca').textContent='🔄 Régénérer le commentaire'}})}
+ else if(!acc){$('ca').style.display='';$('ca').textContent='💬 Générer le commentaire'}
+ if(!acc&&cfg.autoc=='1')for(let k=1;k<=cfg.pre;k++)if(p+k<=g.moves.length)gen(g,p+k)}
+function pa(s){const g=S.g,c=S.v||(g?new Chess(g.fens[S.ply]):new Chess()),pc=c.get(s);
+ if(S.sel&&S.sel!=s){const mv=c.moves({verbose:true}).find(x=>x.from==S.sel&&x.to==s);if(mv){c.move({from:mv.from,to:mv.to,promotion:'q'});S.v=c;S.sel=null;moveSnd(mv);if(g)vev();return rend()}}
+ S.sel=pc&&pc.color==c.turn()?s:null;rend()}
+function vev(){const f=S.v.fen();S.ve='…';ev(f,cfg.d).then(e=>{if(S.v&&S.v.fen()==f){S.ve=fmt(e.cp);S.vcp=e.cp;$('evl').textContent=S.ve;setBar('ebar',e.cp);$('lv').innerHTML=`<i>Variante — meilleur coup Stockfish : <b>${e.best?sans(f,e.best):'—'}</b></i>`}})}
+$('bl').onclick=()=>{const g=S.g,p=S.ply,pv=g&&g.ev&&p>0&&g.ev[p-1].pv;if(!pv||!pv.length)return;const c=new Chess(g.fens[p-1]);S.v=c;S.ve='';rend();pv.forEach((u,i)=>setTimeout(()=>{if(S.v!==c)return;const mv=c.move({from:u.slice(0,2),to:u.slice(2,4),promotion:u[4]});if(mv){moveSnd(mv);rend();$('lv').innerHTML=`<i>Meilleure ligne Stockfish : coup ${i+1}/${pv.length} (${mv.san})</i>`}},800*(i+1)))};
+$('vr').onclick=()=>{S.v=null;S.sel=null;rend()};$('fl').addEventListener('click',()=>{});
+$('ca').onclick=async()=>{const g=S.g,p=S.ply;$('tx').style.display='';$('tx').textContent='…';const t=await gen(g,p,true);if(S.g==g&&S.ply==p){$('tx').textContent=t;if(g.cm[p])$('ca').textContent='🔄 Régénérer le commentaire'}};
+$('ex').onclick=async()=>{const g=S.g,p=S.ply,bu=g.ev[p-1].best;$('bx').style.display='';$('bx').textContent='…';
+ $('bx').textContent=await ai(`FEN : ${g.fens[p-1]}. Pourquoi ${sans(g.fens[p-1],bu)} est meilleur que ${g.moves[p-1].san} ? Contexte : ${ctx(g,p-1)}. 2 phrases courtes.`)};
+$('f0').onclick=()=>go(0);$('f1').onclick=()=>nav(-1);$('f2').onclick=()=>nav(1);$('f3').onclick=()=>{if(S.g)go(S.g.moves.length)};$('fl').onclick=()=>{S.flip=!S.flip;rend()};
+addEventListener('keydown',e=>{const t=e.target.tagName,ty=e.target.type;if(t=='TEXTAREA'||(t=='INPUT'&&ty!='file'&&ty!='checkbox'))return;if(!$('an').classList.contains('on'))return;
+ const k=e.key;if(k=='ArrowLeft'||k=='ArrowRight'||k=='ArrowUp'||k=='ArrowDown'||k=='Home'||k=='End'){e.preventDefault();if(t=='SELECT')e.target.blur();
+ if(k=='ArrowLeft'||k=='ArrowUp')$('f1').click();else if(k=='ArrowRight'||k=='ArrowDown')$('f2').click();else if(k=='Home')$('f0').click();else $('f3').click()}});
+/* ---- résumé ---- */
+let lastTodo=[];
+$('run').onclick=async()=>{if(!S.games.length)return $('sp').textContent='Importe d’abord des parties.';if(!await need('su'))return;$('run').disabled=true;let i=0;
+ for(const g of S.games.filter(x=>x.h.Event!='Répertoire')){i++;await analyze(g,(a,b)=>$('sp').textContent=`Partie ${i}/${S.games.length} — ${a}/${b}`)}$('run').disabled=false;$('sp').textContent='';summary()};
+async function summary(){const me=(cfg.me||'').toLowerCase(),ph={},cnt={},bl=[];let n=0;
+ for(const g of S.games.filter(x=>x.res&&x.h.Event!='Répertoire')){const my=g.h.White.toLowerCase()==me?'w':g.h.Black.toLowerCase()==me?'b':null;n++;
+ g.res.forEach((r,i)=>{if(my&&r.w!=my)return;(ph[r.ph]=ph[r.ph]||[]).push(r.acc);cnt[r.k]=(cnt[r.k]||0)+1;
+ if(r.k=='gaffe'||r.k=='erreur')bl.push({partie:n,coup:Math.floor(i/2)+1,joué:g.moves[i].san,meilleur:r.best?'—':sans(g.fens[i],g.ev[i].best),phase:r.ph,perte_cp:r.cpl,contexte:ctx(g,i)})})}
+ const av=a=>a?a.reduce((x,y)=>x+y,0)/a.length:0,P=['Ouverture','Milieu','Finale'].map(k=>[k,av(ph[k])]);
+ $('sr').innerHTML=`<div class="card"><canvas id="cv" width="800" height="380" style="width:100%;max-width:800px"></canvas><br><button class="b" id="dc">⬇ Télécharger le graphique</button></div><div class="card"><div id="adv" class="bub">Conseils IA en cours…</div><button class="b" id="at">Ajouter à ma to-do</button></div>`;
+ const c=$('cv').getContext('2d'),dk=matchMedia('(prefers-color-scheme:dark)').matches;c.fillStyle=dk?'#292929':'#fff';c.fillRect(0,0,800,380);c.fillStyle=dk?'#eee':'#222';c.font='bold 18px sans-serif';c.fillText('Précision par phase (%)',20,28);c.fillText('Qualité des coups',430,28);c.font='13px sans-serif';
+ P.forEach(([k,v],i)=>{c.fillStyle='#769656';c.fillRect(30+i*115,330-v*2.6,90,v*2.6);c.fillStyle=dk?'#eee':'#222';c.fillText(k,35+i*115,350);c.fillText(v.toFixed(0)+'%',55+i*115,322-v*2.6)});
+ Object.keys(L).forEach((k,i)=>{const v=cnt[k]||0,mx=Math.max(1,...Object.values(cnt));c.fillStyle=L[k];c.fillRect(430,45+i*34,v/mx*280,22);c.fillStyle=dk?'#eee':'#222';c.fillText(k+' : '+v,440+v/mx*280,61+i*34)});
+ $('dc').onclick=()=>dl('resume-echecs.png',$('cv').toDataURL(),1);
+ const worst=P.filter(x=>x[1]).sort((a,b)=>a[1]-b[1])[0];lastTodo=[worst?`Travailler la phase « ${worst[0]} » (précision ${worst[1].toFixed(0)}%)`:'',cnt.gaffe?`Vérifier chaque coup (menaces adverses) avant de jouer : ${cnt.gaffe} gaffes`:''].filter(Boolean);
+ const t=await ai(`Stats locales Stockfish d’un joueur : précision par phase ${JSON.stringify(P)}, coups par qualité ${JSON.stringify(cnt)}. Ses plus grosses erreurs avec contexte complet (coup joué, meilleur coup, temps, menace adverse, tactique manquée) : ${JSON.stringify(bl.sort((a,b)=>b.perte_cp-a.perte_cp).slice(0,10))}. Pour chaque erreur, identifie la VRAIE cause (manque de temps, menace adverse non vue, fourchette/clouage/mat manqué, erreur positionnelle). Dégage les 2-3 causes récurrentes, puis donne un plan de 5 lignes commençant par « - » avec un exercice concret pour chaque.`,undefined,1);
+ $('adv').textContent=t;window.lastAdvice=t;lastTodo.push(...t.split('\n').filter(l=>/^\s*[-•*]/.test(l)).map(l=>l.replace(/^\s*[-•*]\s*/,'').replace(/\*\*/g,'')));
+ $('at').onclick=()=>{lastTodo.forEach(x=>todo.push({t:x,d:0}));save();drawT();$('at').textContent='Ajouté ✔'}}
+/* ---- to-do ---- */
+function drawT(){$('tl').innerHTML=todo.map((x,i)=>`<div class="todo ${x.d?'done':''}"><input type="checkbox" ${x.d?'checked':''} onchange="todo[${i}].d^=1;save();drawT()"><span>${x.t.replace(/</g,'&lt;')}</span><button class="b" onclick="work(${i})">🎯 S’entraîner</button><button class="mv" onclick="mvT(${i},-1)">↑</button><button class="mv" onclick="mvT(${i},1)">↓</button><button class="mv" onclick="todo.splice(${i},1);save();drawT()">🗑</button></div>`).join('')||'<i>Rien pour l’instant.</i>'}
+function mvT(i,d){const j=i+d;if(j<0||j>=todo.length)return;[todo[i],todo[j]]=[todo[j],todo[i]];save();drawT()}
+$('ta').onclick=()=>{const v=$('tn').value.trim();if(v){todo.push({t:v,d:0});$('tn').value='';save();drawT()}};
+$('tc').onclick=()=>{for(let i=todo.length-1;i>=0;i--)if(todo[i].d)todo.splice(i,1);save();drawT()};drawT();
+/* ---- Elo ---- */
+$('eg').onclick=()=>{const r=+$('e1').value,o=+$('e2').value,s=+$('er').value,k=+$('ek').value,t=$('es').value;let n;
+ if(t=='fide')n=r+k*(s-1/(1+10**((o-r)/400)));
+ else{const q=Math.log(10)/400,g=x=>1/Math.sqrt(1+3*q*q*x*x/Math.PI**2),RD=k||75,go=g(RD),E=1/(1+10**(-go*(r-o)/400)),d2=1/(q*q*go*go*E*(1-E));n=r+q/(1/RD**2+1/d2)*go*(s-E)}
+ $('eo').textContent=`Nouvel Elo : ${n.toFixed(1)} (${n>=r?'+':''}${(n-r).toFixed(1)})`};
+/* ---- problèmes ---- */
+const TH={'':'Aléatoire (Lichess)',own:'Mes erreurs (mes parties)',mateIn1:'Mat en 1',mateIn2:'Mat en 2',mateIn3:'Mat en 3',fork:'Fourchette',pin:'Clouage',skewer:'Enfilade',hangingPiece:'Pièce en prise',discoveredAttack:'Attaque à la découverte',sacrifice:'Sacrifice',defensiveMove:'Coup défensif',trappedPiece:'Pièce piégée',backRankMate:'Mat du couloir',opening:'Ouverture',middlegame:'Milieu de jeu',endgame:'Finale'};
+$('pt').innerHTML=Object.entries(TH).map(([k,v])=>`<option value="${k}">${v}</option>`).join('');
+let P=null,Z={n:0,s:0,item:-1},sel=null;
+const guess=t=>{t=t.toLowerCase();return/ouverture/.test(t)?'opening':/finale/.test(t)?'endgame':/milieu/.test(t)?'middlegame':/gaffe|menace|prise|vérifier/.test(t)?'hangingPiece':/mat/.test(t)?'mateIn2':/fourchette/.test(t)?'fork':/clou/.test(t)?'pin':''};
+const stat=()=>$('ps').textContent=Z.n?`Série : ${Z.s}/${Z.n}`:'';
+async function work(i){const n=parseInt(prompt('Combien de problèmes réussir d’affilée (sans erreur) ?','3'));if(!n||n<1)return;if(!await need('td'))return;Z={n,s:0,item:i};$('pt').value=guess(todo[i].t);document.querySelector('[data-t=pz]').click();stat();newP()}
+const valid=(fen,sol)=>{const c=new Chess(fen);return sol.every(u=>c.move({from:u.slice(0,2),to:u.slice(2,4),promotion:u[4]}))};
+async function newP(){if(!(Z.n>0)&&!await need('pz'))return;sel=null;P=null;$('pm').textContent='Chargement…';$('par').innerHTML='';const th=$('pt').value;let p=null,best=1e9;
+ if(th!='own')try{for(let k=0;k<6;k++){const j=await(await fetch('https://lichess.org/api/puzzle/next'+(th?'?angle='+th:''))).json(),c=new Chess();
+  if(!j.game.pgn.split(' ').every(s=>!s||c.move(s,{sloppy:true}))||!valid(c.fen(),j.puzzle.solution))continue;const dd=Math.abs(j.puzzle.rating-cfg.elo);
+  if(dd<best){best=dd;p={fen:c.fen(),sol:j.puzzle.solution,info:`Lichess #${j.puzzle.id} · ${j.puzzle.rating} Elo · ${j.puzzle.themes.join(', ')}`}}if(dd<=250)break}}catch(e){}
+ if(!p){const a=[],me=(cfg.me||'').toLowerCase();S.games.forEach(g=>g.res&&g.res.forEach((r,i)=>{const my=g.h.White.toLowerCase()==me?'w':g.h.Black.toLowerCase()==me?'b':null;
+  if((r.k=='gaffe'||r.k=='erreur')&&g.ev[i].best&&(!my||g.moves[i].color==my)&&valid(g.fens[i],[g.ev[i].best]))a.push({fen:g.fens[i],sol:[g.ev[i].best],info:'Tirée de tes erreurs (Stockfish)'})}));p=a[Math.floor(Math.random()*a.length)]}
+ if(!p)return $('pm').textContent='Aucun problème (Lichess indisponible, et aucune erreur analysée dans tes parties).';
+ const c=new Chess(p.fen);P={c,sol:p.sol,i:0,err:0,flip:c.turn()=='b'};$('pi').textContent=p.info;$('pm').textContent=(c.turn()=='w'?'Aux Blancs':'Aux Noirs')+' de jouer — trouve le meilleur coup.';pdraw()}
+function pdraw(){const b=P.c.board(),f=P.flip,lg=sel?P.c.moves({square:sel,verbose:true}).map(m=>m.to):[];let h='';for(let y=0;y<8;y++)for(let x=0;x<8;x++){const r=f?7-y:y,c=f?7-x:x,s=b[r][c],sq='abcdefgh'[c]+(8-r);
+ h+=`<div class="sq ${(r+c)%2?'k':'w'} ${sel==sq?'sl':''} ${lg.includes(sq)?'lg':''}" data-sq="${sq}" data-cb="pk"><span class="${s&&s.color=='w'?'pw':'pb'}">${s?U[s.type]+'\uFE0E':'&nbsp;'}</span>${co(x,y,r,c)}</div>`}$('pbd').innerHTML=h}
+function pk(s){if(!P||P.done||P.busy)return;const c=P.c,pc=c.get(s);$('par').innerHTML='';
+ if(sel&&sel!=s){const mv=c.moves({verbose:true}).find(m=>m.from==sel&&m.to==s);if(mv){const u=sel+s+(mv.flags.includes('p')?'q':'');sel=null;return tm(mv,u)}}
+ sel=pc&&pc.color==c.turn()?s:null;pdraw()}
+function tm(mv,u){const c=P.c,e=P.sol[P.i];c.move({from:mv.from,to:mv.to,promotion:'q'});moveSnd(mv);
+ if(u==e||c.in_checkmate()){P.i++;pdraw();if(c.in_checkmate()||P.i>=P.sol.length)return win();P.busy=1;$('pm').textContent='Bien ! Continue…';
+  setTimeout(()=>{const o=P.sol[P.i++];c.move({from:o.slice(0,2),to:o.slice(2,4),promotion:o[4]});P.busy=0;pdraw();if(P.i>=P.sol.length)win()},500)}
+ else{c.undo();P.err=1;Z.s=0;stat();$('pm').textContent='❌ Ce n’est pas le bon coup, réessaie (série remise à 0).';snd('err');pdraw()}}
+function win(){P.done=1;snd('win');if(!P.err)Z.s++;stat();$('pm').textContent=P.err?'Résolu, mais avec erreur : ne compte pas dans la série.':'✅ Réussi !';
+ if(Z.n&&Z.s>=Z.n){if(todo[Z.item]){todo[Z.item].d=1;save();drawT()}alert('🏆 Objectif atteint : '+Z.n+' d’affilée !');Z.n=0;stat()}else if(!P.err)setTimeout(newP,1200)}
+$('pn').onclick=newP;$('pp').onclick=()=>{Z.s=0;stat();newP()};
+$('ph').onclick=()=>{if(!P||P.done)return;P.err=1;$('par').innerHTML=arrow(P.sol[P.i],'#2e9e44',P.flip)};
+$('pq').onclick=async()=>{const t=$('px').value.trim();if(!t)return;$('pm').textContent='IA…';const r=await ai(`Choisis UN seul identifiant dans cette liste qui correspond le mieux à la demande « ${t} » : ${Object.keys(TH).filter(k=>k&&k!='own').join(', ')}. Réponds uniquement par l’identifiant.`),k=Object.keys(TH).filter(k=>k&&r.includes(k)).sort((a,b)=>b.length-a.length)[0];
+ if(k){$('pt').value=k;newP()}else $('pm').textContent='Thème non reconnu : '+r};
+/* ---- ouvertures ---- */
+const OP=[['Italienne (Giuoco Piano)','e4 e5 Nf3 Nc6 Bc4 Bc5','Développement rapide, contrôle du centre, plan c3-d4.'],['Espagnole (Ruy Lopez)','e4 e5 Nf3 Nc6 Bb5 a6 Ba4 Nf6 O-O Be7','Pression sur le cavalier c6 et le centre : le grand classique.'],['Écossaise','e4 e5 Nf3 Nc6 d4 exd4 Nxd4','Ouvre le centre tout de suite, jeu actif.'],['Gambit du Roi','e4 e5 f4 exf4 Nf3 g5','Attaque rapide et romantique, risquée.'],['Sicilienne Najdorf','e4 c5 Nf3 d6 d4 cxd4 Nxd4 Nf6 Nc3 a6','Défense combative des Noirs, positions déséquilibrées.'],['Française','e4 e6 d4 d5 Nc3 Nf6 Bg5 Be7','Structure solide, jeu sur les ailes ; le fou c8 est à libérer.'],['Caro-Kann','e4 c6 d4 d5 Nc3 dxe4 Nxe4 Bf5','Très solide : bonne structure, fou développé dehors.'],['Pirc','e4 d6 d4 Nf6 Nc3 g6 Nf3 Bg7','Les Noirs laissent le centre aux Blancs puis le contestent.'],['Gambit Dame','d4 d5 c4 e6 Nc3 Nf6 Bg5 Be7','Les Blancs visent le centre ; position saine et classique.'],['Défense Slave','d4 d5 c4 c6 Nf3 Nf6 Nc3 dxc4','c6 soutient d5, très solide.'],['Est-Indienne','d4 Nf6 c4 g6 Nc3 Bg7 e4 d6','Les Noirs laissent le centre puis le frappent.'],['Système de Londres','d4 d5 Bf4 Nf6 e3 e6 Nf3 c5 c3','d4 peut surprendre les adversaires de bas niveau, 80% d’entre eux étant habitués à e4. Comme les Blancs emploient le même dispositif contre un grand nombre de réponses noires, la théorie du Système de Londres est beaucoup moins étendue que pour la plupart des autres ouvertures : pas besoin de mémoriser des lignes longues, seulement les plans selon le type de position (placement des pièces, structures de pions). Conseillé aux débutants pour cette raison.'],['Anglaise','c4 e5 Nc3 Nf6 Nf3 Nc6 g3','Flexible, contrôle de d5 depuis le flanc.']];
+$('ol').innerHTML=OP.map((o,i)=>`<div class="card"><b>${o[0]}</b><div style="opacity:.7;margin:4px 0">${o[1]}</div><div>${o[2]}</div><button class="b" style="margin-top:6px" onclick="ouv(${i})">Étudier dans l’analyse</button></div>`).join('');
+function ouv(i){const o=OP[i],m=o[1].split(' '),pgn=`[Event "Répertoire"]\n[Date "-"]\n[White "Répertoire"]\n[Black "${o[0]}"]\n[Result "*"]\n\n${m.map((x,k)=>k%2?x:(k/2+1)+'. '+x).join(' ')} *`;add([pgn]);const k=S.games.findIndex(g=>g.pgn==pgn);if(k<0)return;$('gs').value=k;document.querySelector('[data-t=an]').click();pick(k)}
+/* ---- jouer contre le coach ---- */
+let W2,Y=null;const mkW=()=>new Worker(URL.createObjectURL(new Blob(["importScripts('https://cdnjs.cloudflare.com/ajax/libs/stockfish.js/10.0.2/stockfish.js')"])));
+const jd=()=>{if(Y){$('jbd').innerHTML=bh(Y.c,Y.u=='b',Y.sel,(Y.last||[]).concat(Y.pre?[Y.pre.from,Y.pre.to]:[]),'pj');mateFX(Y.c,'#jbd',Y.c.fen()+':jo')}};
+async function jnew(){if(!await need('jo'))return;if(Y&&!Y.c.game_over())jimp('*');Y={c:new Chess(),u:$('jcol').value,busy:0,last:[],cp:0};const el=Math.max(1350,Math.min(2850,Math.round(cfg.elo*1.15)));$('jinf').textContent=`Stockfish bridé à ~${el} Elo (ton Elo +15 %)`;$('jr').textContent='';$('jar').innerHTML='';$('jc').textContent='À toi de jouer — je commente chaque coup.';jd();setBar('jbar',0);if(Y.u=='b')botMove()}
+function jend(){const c=Y.c;if(!c.game_over())return false;$('jr').innerHTML='<b>'+(c.in_checkmate()?(c.turn()==Y.u?'Échec et mat — tu as perdu.':'Échec et mat — bravo, tu as gagné !'):'Partie nulle.')+'</b>';snd('win');jimp(RES(c));return true}
+function botMove(){Y.busy=1;const el=Math.max(1350,Math.min(2850,Math.round(cfg.elo*1.15))),Yc=Y;if(!W2){W2=mkW();W2.postMessage('uci')}
+ W2.onmessage=e=>{const l=String(e.data);if(l.startsWith('bestmove')&&Y===Yc){const u=l.split(' ')[1];Y.busy=0;if(!u||u=='(none)')return;const mv=Y.c.move({from:u.slice(0,2),to:u.slice(2,4),promotion:u[4]||'q'});Y.last=[mv.from,mv.to];moveSnd(mv);jd();if(!jend()){tryPre();ev(Y.c.fen(),8).then(e=>{if(Y===Yc){Y.cp=e.cp;setBar('jbar',e.cp)}})}}};
+ W2.postMessage('setoption name UCI_LimitStrength value true');W2.postMessage('setoption name UCI_Elo value '+el);W2.postMessage('position fen '+Y.c.fen());W2.postMessage('go movetime 700')}
+function tryPre(){if(!Y||!Y.pre||Y.c.game_over()||Y.c.turn()!=Y.u)return;const pr=Y.pre;Y.pre=null;const c=Y.c,mv=c.moves({verbose:true}).find(x=>x.from==pr.from&&x.to==pr.to);if(!mv)return;
+ const fb=c.fen(),m=c.move({from:mv.from,to:mv.to,promotion:'q'});Y.last=[m.from,m.to];moveSnd(m);jd();coach(fb,c.fen(),m);if(!jend())botMove()}
+function pj(s){if(!Y||Y.c.game_over())return;const c=Y.c,pc=c.get(s);
+ if(c.turn()!=Y.u){if(Y.sel&&Y.sel!=s){Y.pre={from:Y.sel,to:s};Y.sel=null;return jd()}Y.sel=pc&&pc.color==Y.u?s:null;return jd()}
+ if(Y.busy)return;$('jar').innerHTML='';Y.pre=null;
+ if(Y.sel&&Y.sel!=s){const mv=c.moves({verbose:true}).find(x=>x.from==Y.sel&&x.to==s);if(mv){const fb=c.fen(),m=c.move({from:mv.from,to:mv.to,promotion:'q'});Y.sel=null;Y.last=[m.from,m.to];moveSnd(m);jd();coach(fb,c.fen(),m);if(!jend())botMove();return}}
+ Y.sel=pc&&pc.color==c.turn()?s:null;jd()}
+async function coach(fb,fa,m){const Yc=Y;$('jc').textContent='Analyse…';const[a,b]=await Promise.all([ev(fb,cfg.d),ev(fa,cfg.d)]);if(Y===Yc){Y.cp=b.cp;setBar('jbar',b.cp)}const w=m.color=='w'?1:-1,loss=Math.max(0,wp(a.cp*w)-wp(b.cp*w)),bt=m.from+m.to+(m.promotion||'')==a.best,k=lvl(loss,bt),bs=a.best&&!bt?sans(fb,a.best):'';
+ if(Y!==Yc)return;$('jc').innerHTML=`<span class="dot" style="background:${L[k]}"></span><b>${m.san} — ${k}</b>${bs?`<br>Meilleur : <b>${bs}</b>`:''}<div id="jt">…</div>`;$('jar').innerHTML=bs?arrow(a.best,'#2e9e44',Y.u=='b'):'';
+ const t=await ai(`Partie en direct. Le joueur a joué ${m.san}, jugé « ${k} ». ${bs?'Meilleur : '+bs+'. ':''}FEN avant : ${fb}. 1-2 phrases courtes.`);if(Y===Yc&&$('jt'))$('jt').textContent=t}
+$('jn').onclick=jnew;
+/* ---- fournisseurs IA ---- */
+const opts=(l,c)=>{l=l||[];if(c&&!l.includes(c))l=[c,...l];return l.map(m=>`<option ${m==c?'selected':''}>${esc(m)}</option>`).join('')};
+function rp(){$('pl').innerHTML=cfg.provs.map((x,i)=>`<div class="card"><div class="row"><b>#${i+1}</b><input value="${esc(x.name)}" size="10" placeholder="Nom" onchange="pv(${i},'name',this.value)"><input value="${esc(x.url)}" size="30" placeholder="URL compatible OpenAI (…/v1)" onchange="pv(${i},'url',this.value)"><input type="password" value="${esc(x.key)}" placeholder="Clé API" onchange="pv(${i},'key',this.value)"><button class="b" onclick="pm_(${i})">↻ Modèles</button></div>
+<div class="row" style="margin-top:6px"><label>Modèle <select onchange="pv(${i},'model',this.value)">${opts(x.models,x.model)}</select></label><label>Léger (Flash) <select onchange="pv(${i},'light',this.value)">${opts(x.models,x.light)}</select></label><button class="mv" onclick="mvp(${i},-1)">↑</button><button class="mv" onclick="mvp(${i},1)">↓</button><button class="mv" onclick="cfg.provs.splice(${i},1);save();rp()">🗑</button><span>${x.until>Date.now()?'⏸ suspendu jusqu’au '+new Date(x.until).toLocaleString():'✅ actif'}</span>${x.until>Date.now()?`<button class="mv" onclick="pv(${i},'until',0);rp()">Réactiver</button>`:''}</div></div>`).join('')}
+function pv(i,k,v){cfg.provs[i][k]=k=='until'?v:String(v).trim();save()}
+function mvp(i,d){const j=i+d;if(j<0||j>=cfg.provs.length)return;[cfg.provs[i],cfg.provs[j]]=[cfg.provs[j],cfg.provs[i]];save();rp()}
+function addP(n,u){cfg.provs.push({name:n,url:u,key:'',model:'',light:'',models:[],until:0});save();rp()}
+async function pm_(i){const x=cfg.provs[i];try{const r=await fetch(x.url.replace(/\/+$/,'')+'/models',{headers:x.key?{Authorization:'Bearer '+x.key}:{}}),j=await r.json();let a=(j.data||[]).map(m=>m.id).filter(m=>!/whisper|guard|tts|embed|playai/i.test(m));if(/openrouter/i.test(x.url))a=a.filter(m=>/free/i.test(m));a.sort();if(!a.length)throw new Error(JSON.stringify(j.error||'aucun modèle'));
+ x.models=a;if(!a.includes(x.model)||x.model=='openrouter/free'&&!/openrouter/i.test(x.url))x.model=a.find(m=>/70b|versatile|large|pro/i.test(m))||a[0];if(!a.includes(x.light)||x.light==x.model&&x.light!='openrouter/free')x.light=a.find(m=>/-(1|3|4|7|8|9)b|mini|nano|flash|lite|instant/i.test(m))||x.model;save();rp()}catch(e){alert('Erreur : '+e.message)}}
+rp();
+/* ---- classement (Worker KV) ---- */
+let LB=[];
+async function lbCall(op,b){const w=(cfg.worker||'').replace(/\/+$/,'');if(!w){$('lbm').textContent='URL du Worker manquante (Paramètres)';return null}try{return await(await fetch(w+'/lb/'+op,{method:'POST',body:JSON.stringify(b||{})})).json()}catch(e){$('lbm').textContent=e.message;return null}}
+function lbDraw(){const k=$('lbk').value,f=$('lbf').value;$('lbt').innerHTML=LB.filter(x=>f=='all'||x.p==f).sort((a,b)=>b.r[k]-a.r[k]).map((x,i)=>`<tr><td>${['🥇','🥈','🥉'][i]||i+1}</td><td>${esc(x.n)}</td><td>${x.p=='lichess'?'Lichess':'Chess.com'}</td><td><b>${x.r[k]||'—'}</b></td></tr>`).join('')}
+async function lbLoad(){$('lbm').textContent='…';const j=await lbCall('list');if(j&&j.list){LB=j.list;lbDraw();$('lbm').textContent=LB.length+' joueurs'}else if(j)$('lbm').textContent=j.error||'';
+ const gj=await lbCall('golden');if(gj&&gj.golden)$('goldm').textContent=`Dernier gagnant : ${gj.golden.name} (${gj.golden.p=='lichess'?'Lichess':'Chess.com'}, ${gj.golden.rating}) le ${new Date(gj.golden.t).toLocaleDateString()}.`}
+$('lbr').onclick=lbLoad;$('lbk').onchange=$('lbf').onchange=lbDraw;document.querySelector('[data-t=lb]').addEventListener('click',lbLoad);
+$('lba').onclick=async()=>{const n=$('lbn').value.trim();if(!n||!await need())return;$('lbm').textContent='…';const j=await api('lb/add',{p:$('lbp').value,n});if(j.list){LB=j.list;lbDraw();$('lbm').textContent=j.msg}else $('lbm').textContent=j.error};
+/* ---- accès aux onglets ---- */
+const GT=new Set(['su','pz','td','jo','mm','op','to','lb','ch','sh']);
+document.querySelectorAll('nav button[data-t]').forEach(b=>b.addEventListener('click',e=>{if(GT.has(b.dataset.t)&&!(AU&&ME)){e.stopImmediatePropagation();need();return}
+ if(b.dataset.t=='ia'&&!(ME&&ME.prem>Date.now())){e.stopImmediatePropagation();alert('Fournir tes propres clés API est une fonction Premium. En compte gratuit, utilise tes tokens IA (Boutique).');document.querySelector('[data-t=pr]').click()}},true));
+refresh();
+/* ---- import des parties jouées ---- */
+const RES=c=>c.in_checkmate()?(c.turn()=='w'?'0-1':'1-0'):'1/2-1/2';
+function impG(c,w,b,res){c.header('Event','Chess Analyses','Date',new Date().toISOString().slice(0,10).replace(/-/g,'.'),'White',w,'Black',b,'Result',res);const n=add([c.pgn()]);$('ist').textContent=n?'Partie importée ✔':''}
+function jimp(res){if(!Y||Y.imp||Y.c.history().length<2)return;Y.imp=1;const me=cfg.me||(AU&&AU.u)||'Moi',b='Stockfish ('+Math.round(cfg.elo*1.15)+')';impG(Y.c,Y.u=='w'?me:b,Y.u=='w'?b:me,res)}
+/* ---- 1v1 pair à pair + matchmaking KV ---- */
+let MM=null,G=null;const RC={},wait=ms=>new Promise(r=>setTimeout(r,ms)),ICE={iceServers:[{urls:'stun:stun.l.google.com:19302'}]};
+const gather=pc=>new Promise(r=>{if(pc.iceGatheringState=='complete')return r();pc.onicegatheringstatechange=()=>pc.iceGatheringState=='complete'&&r();setTimeout(r,4000)});
+async function eloOf(n){if(RC[n]!=null)return RC[n];try{const j=await(await fetch('https://api.chess.com/pub/player/'+encodeURIComponent(n.toLowerCase())+'/stats')).json();return RC[n]=((j.chess_rapid||j.chess_blitz||{}).last||{}).rating||1200}catch(e){return RC[n]=1200}}
+const mdr=()=>{if(G){$('mbd').innerHTML=bh(G.c,G.u=='b',G.sel,(G.last||[]).concat(G.pre?[G.pre.from,G.pre.to]:[]),'pm2');mateFX(G.c,'#mbd',G.c.fen()+':mm')}};
+function tryPreMM(){if(!G||!G.pre||G.c.game_over()||G.c.turn()!=G.u)return;const pr=G.pre;G.pre=null;const c=G.c,mv=c.moves({verbose:true}).find(x=>x.from==pr.from&&x.to==pr.to);if(!mv)return;
+ const m=c.move({from:mv.from,to:mv.to,promotion:'q'});G.last=[m.from,m.to];G.dc.send(JSON.stringify({t:'mv',f:m.from,to:m.to,p:'q'}));moveSnd(m);mdr();mend()}
+function mend(r){if(!G||G.done)return;let res;if(r=='me')res=G.u=='w'?'0-1':'1-0';else if(r=='opp')res=G.u=='w'?'1-0':'0-1';else if(G.c.game_over())res=RES(G.c);else return;G.done=1;$('mmj').innerHTML='<b>Résultat : '+res+'</b>';snd('win');impG(G.c,G.u=='w'?G.name:G.opp,G.u=='w'?G.opp:G.name,res);api('mm/leave')}
+function wire(dc,col,opp){dc.onopen=()=>{MM.on=0;G={c:new Chess(),u:col,dc,opp,last:[],name:MM.name};$('mmi').textContent=`${G.name} (${col=='w'?'Blancs':'Noirs'}) vs ${opp}`;$('mmj').textContent='Partie lancée !';$('mms').textContent='';$('mmr').style.display='';mdr();snd('win')};
+ dc.onmessage=e=>{const m=JSON.parse(e.data);if(!G)return;if(m.t=='mv'){const mv=G.c.move({from:m.f,to:m.to,promotion:m.p||'q'});if(mv){G.last=[mv.from,mv.to];moveSnd(mv);mdr();tryPreMM();mend()}}else if(m.t=='res')mend('opp')};dc.onclose=()=>{if(G&&!G.done)$('mmj').textContent='Connexion perdue.'}}
+function pm2(s){if(!G||G.done)return;const c=G.c,pc=c.get(s);
+ if(c.turn()!=G.u){if(G.sel&&G.sel!=s){G.pre={from:G.sel,to:s};G.sel=null;return mdr()}G.sel=pc&&pc.color==G.u?s:null;return mdr()}
+ G.pre=null;if(G.sel&&G.sel!=s){const mv=c.moves({verbose:true}).find(x=>x.from==G.sel&&x.to==s);if(mv){const m=c.move({from:mv.from,to:mv.to,promotion:'q'});G.sel=null;G.last=[m.from,m.to];G.dc.send(JSON.stringify({t:'mv',f:m.from,to:m.to,p:'q'}));moveSnd(m);mdr();mend();return}}G.sel=pc&&pc.color==c.turn()?s:null;mdr()}
+async function mmOffer(t){const pc=new RTCPeerConnection(ICE),dc=pc.createDataChannel('g');MM.pc0=pc;MM.t0=Date.now();wire(dc,'w',t.name);await pc.setLocalDescription(await pc.createOffer());await gather(pc);await api('mm/offer',{to:t.u,name:MM.name,sdp:JSON.stringify(pc.localDescription)})}
+async function mmAnswer(o){const pc=new RTCPeerConnection(ICE);pc.ondatachannel=e=>wire(e.channel,'b',o.name);await pc.setRemoteDescription(JSON.parse(o.sdp));await pc.setLocalDescription(await pc.createAnswer());await gather(pc);MM.pc=pc;await api('mm/answer',{to:o.from,sdp:JSON.stringify(pc.localDescription)})}
+async function mmStart(){if(!await need())return;const name=$('mmn').value.trim();if(!name)return $('mms').textContent='Indique ton pseudo chess.com';if(G&&!G.done)return;G=null;MM={name,on:1};const my=await eloOf(name);$('mms').textContent=`Recherche (~${my} Elo)… la mise en relation peut prendre jusqu’à une minute.`;
+ while(MM&&MM.on){try{const j=await api('mm/join',{name}),p=await api('mm/poll');
+  if(p.offer){if(MM.pc0){MM.pc0.close();MM.pc0=null}await mmAnswer(p.offer);return}
+  if(p.answer&&MM.pc0){await MM.pc0.setRemoteDescription(JSON.parse(p.answer));return}
+  if(MM.pc0&&Date.now()-MM.t0>40000){MM.pc0.close();MM.pc0=null}
+  if(!MM.pc0&&j.room&&j.room.length){let b=null,bd=1e9;for(const x of j.room){const d=Math.abs(await eloOf(x.name)-my);if(d<bd){bd=d;b=x}}if(b){$('mms').textContent=`Adversaire proche : ${b.name} — connexion…`;await mmOffer(b)}}}catch(e){}await wait(3000)}}
+$('mmb').onclick=mmStart;$('mmx').onclick=()=>{if(MM)MM.on=0;$('mms').textContent='';api('mm/leave')};$('mmr').onclick=()=>{if(G&&!G.done){try{G.dc.send(JSON.stringify({t:'res'}))}catch(e){}mend('me')}};
+/* ---- glisser-déposer (coups légaux uniquement) ---- */
+let DR=null;const cell=(s,cb)=>document.querySelector(`.sq[data-sq="${s}"][data-cb="${cb}"]`);
+document.addEventListener('dragstart',e=>e.preventDefault());
+document.addEventListener('pointerdown',e=>{const q=e.target.closest('.sq[data-sq]');if(!q||e.button>0)return;const sp=q.querySelector('span'),f=window[q.dataset.cb];e.preventDefault();DR={sq:q.dataset.sq,cb:q.dataset.cb,x:e.clientX,y:e.clientY,w:q.offsetWidth,tx:sp?sp.textContent.trim():'',cls:sp?sp.className:'',g:null};if(f)f(DR.sq)});
+addEventListener('pointermove',e=>{if(!DR)return;if(!DR.g&&DR.tx&&Math.hypot(e.clientX-DR.x,e.clientY-DR.y)>6){const g=document.createElement('div');g.textContent=DR.tx;g.className=DR.cls;g.style.cssText=`position:fixed;pointer-events:none;z-index:99;font-size:${DR.w*.85}px;line-height:1;transform:translate(-50%,-50%)`;document.body.appendChild(g);DR.g=g;const c=cell(DR.sq,DR.cb);if(c&&c.firstChild)c.firstChild.style.opacity=.25}if(DR.g){DR.g.style.left=e.clientX+'px';DR.g.style.top=e.clientY+'px'}});
+const dend=e=>{if(!DR)return;const d=DR;DR=null;if(!d.g)return;d.g.remove();const c=cell(d.sq,d.cb);if(c&&c.firstChild)c.firstChild.style.opacity='';if(e.type=='pointercancel')return;const q=document.elementFromPoint(e.clientX,e.clientY),t=q&&q.closest('.sq[data-sq]');if(t&&t.dataset.cb==d.cb&&t.dataset.sq!=d.sq)window[d.cb](t.dataset.sq)};
+addEventListener('pointerup',dend);addEventListener('pointercancel',dend);
+/* ---- Coach IA : chat avec contexte personnalisé + actions (to-do) ---- */
+let chat=st.chat||[];
+function buildContext(){if(!$('chx').checked)return'ACCÈS REFUSÉ : le joueur n’a PAS autorisé l’accès à ses données. N’invente aucun chiffre, ne prétends rien savoir de son profil, réponds de façon générale.';
+ const parts=[`Pseudo : ${cfg.me||'(non renseigné)'}.`,`Elo déclaré par le joueur dans les Paramètres du site : ${cfg.elo}.`];
+ const an=S.games.filter(x=>x.res&&x.h.Event!='Répertoire');
+ if(an.length){const cnt={};an.forEach(g=>g.res.forEach(r=>cnt[r.k]=(cnt[r.k]||0)+1));
+  parts.push(`${an.length} partie(s) importée(s) et analysée(s) localement par Stockfish (liste : ${S.games.map((g,i)=>(i+1)+'. '+g.label).join(' | ')}). Répartition totale des coups par qualité : ${JSON.stringify(cnt)}.`)}
+ else parts.push('Aucune partie analysée pour l’instant.');
+ if(window.lastAdvice)parts.push('Dernier diagnostic généré par l’onglet Résumé : '+window.lastAdvice.slice(0,600));
+ parts.push('To-do actuelle (index:texte:fait?) : '+(todo.length?todo.map((x,i)=>`${i}:${x.t}:${x.d?'fait':'en cours'}`).join(' | '):'(vide)'));
+ return parts.join('\n')}
+function gameRef(msg){const m=msg.match(/partie\s*(?:n[o°]?\s*)?(\d+)/i);if(!m)return'';const g=S.games[+m[1]-1];if(!g||!g.res)return'';
+ const cnt={};g.res.forEach(r=>cnt[r.k]=(cnt[r.k]||0)+1);
+ return`\n\nDonnées détaillées de la partie ${m[1]} référencée (${g.label}) : résultat ${g.h.Result}. Qualité des coups : ${JSON.stringify(cnt)}. Pires coups : ${JSON.stringify(g.res.map((r,i)=>({coup:g.moves[i].san,k:r.k,perte:r.cpl})).filter(x=>x.k=='gaffe'||x.k=='erreur').slice(0,8))}.`}
+function drawChat(){$('chl').innerHTML=chat.map(m=>`<div class="msg ${m.r}">${esc(m.c).replace(/\n/g,'<br>')}</div>`).join('')||'<div class="msg sys">Pose ta première question — ex. « pourquoi d5 est mieux que e5 ici ? », « que dois-je travailler en priorité ? », « analyse ma partie 2 », « ajoute “revoir les finales de tours” à ma to-do ».</div>';$('chl').scrollTop=$('chl').scrollHeight}
+function applyActions(text){const lines=text.split('\n'),kept=[],done=[];
+ for(const l of lines){const m=l.match(/^\s*ACTION:\s*(add_todo|done_todo|remove_todo)\s*\|\s*(.+?)\s*$/i);
+  if(!m){kept.push(l);continue}const[,op,arg]=m;
+  if(op.toLowerCase()=='add_todo'){todo.push({t:arg,d:0});done.push('➕ Ajouté à la to-do : « '+arg+' »')}
+  else{const idx=/^\d+$/.test(arg)?+arg:todo.findIndex(x=>x.t.toLowerCase().includes(arg.toLowerCase()));
+   if(todo[idx]){if(op.toLowerCase()=='done_todo'){todo[idx].d=1;done.push('✅ Coché dans la to-do : « '+todo[idx].t+' »')}else{done.push('🗑 Retiré de la to-do : « '+todo[idx].t+' »');todo.splice(idx,1)}}}}
+ if(done.length){save();try{drawT()}catch(e){}}
+ return(kept.join('\n').trim())+(done.length?'\n\n'+done.join('\n'):'')}
+async function sendChat(){const txt=$('chi').value.trim();if(!txt)return;$('chi').value='';chat.push({r:'u',c:txt});drawChat();st.chat=chat;save();
+ const sys=`Tu es le coach d’échecs personnel intégré à ce site (Chess Analysis). Tu as un ACCÈS DIRECT et RÉEL aux données ci-dessous, injectées automatiquement à chaque message : ne dis JAMAIS que tu n’as pas accès à ces informations, elles sont vraies et à jour. Cite des chiffres précis quand on te les demande. Sois concret : donne des exemples de lignes, de plans, de statistiques par tranche d’Elo quand c’est pertinent, ne te limite pas à des généralités.
+Tu peux aussi AGIR sur la to-do du joueur (lecture, ajout, suppression, cocher comme fait). Pour cela, termine ta réponse par une ou plusieurs lignes au format exact (une action par ligne, rien d’autre sur la ligne) :
+ACTION: add_todo | texte du point à ajouter
+ACTION: done_todo | texte ou index exact à cocher comme fait
+ACTION: remove_todo | texte ou index exact à supprimer
+N’utilise ces lignes QUE si le joueur te le demande explicitement ou si c’est clairement utile (ex. il te dit « ajoute X à ma to-do »). Ces lignes seront exécutées puis retirées de ce que voit le joueur, donc formule aussi une confirmation normale en français juste avant.
+--- Données réelles du joueur ---
+${buildContext()}${gameRef(txt)}`;
+ const hist=chat.slice(-16).map(m=>({role:m.r=='u'?'user':'assistant',content:m.c}));
+ chat.push({r:'a',c:'…'});drawChat();
+ let t=await callLLM([{role:'system',content:sys},...hist],undefined);
+ t=applyActions(t);
+ chat[chat.length-1]={r:'a',c:t};st.chat=chat;save();drawChat()}
+$('chs').onclick=sendChat;$('chi').addEventListener('keydown',e=>{if(e.key=='Enter'&&!e.shiftKey){e.preventDefault();sendChat()}});
+$('chc').onclick=()=>{chat=[];st.chat=chat;save();drawChat()};
+drawChat();
+/* Dissuasion cosmétique : ne bloque pas un utilisateur déterminé (menu navigateur, view-source:, outils dev déjà ouverts) */
+document.addEventListener('keydown',e=>{const k=e.key.toLowerCase();if((e.ctrlKey||e.metaKey)&&(k=='u'||(e.shiftKey&&['i','j','c'].includes(k)))||k=='f12')e.preventDefault()});
+document.addEventListener('contextmenu',e=>e.preventDefault());
+rend();
+</script></body></html>
