@@ -239,8 +239,15 @@ const ev=(fen,d)=>q=q.then(()=>new Promise(async res=>{
       /* Le cloud a répondu — met à jour la barre d'évaluation même si local a déjà résolu */
       if(!done){done=true;res(r)}
       else{
-        /* Mise à jour silencieuse de la barre si déjà affiché */
-        try{setBar('ebar',r.cp);const el=document.getElementById('evl');if(el)el.textContent=fmt(r.cp)+' ☁';}catch(e){}
+        /* Mise à jour de la barre avec badge cloud visible */
+        try{
+          setBar('ebar',r.cp);
+          const el=document.getElementById('evl');
+          if(el)el.innerHTML=fmt(r.cp)+'<span style="background:#2563eb;color:#fff;font-size:10px;padding:1px 5px;border-radius:4px;margin-left:6px;vertical-align:middle" title="Analyse Stockfish cloud (depth 20+)">☁ Cloud</span>';
+          const bm=document.getElementById('bm');
+          if(bm&&r.best)bm.innerHTML=r.best+'<span style="background:#2563eb;color:#fff;font-size:9px;padding:1px 4px;border-radius:3px;margin-left:4px">☁</span>';
+          console.log('%c☁ Cloud Stockfish (depth 20+): '+r.best+' eval='+fmt(r.cp),'color:#2563eb;font-weight:bold');
+        }catch(e){}
       }
     }
   });
