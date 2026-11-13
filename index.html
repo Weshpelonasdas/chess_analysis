@@ -190,13 +190,63 @@ async function callLLM(messages,mode){mode=mode||$('im').value;
 async function ai(p,mode,long){return callLLM([{role:'system',content:long?'Tu es un coach d’échecs. Français, structuré, concis.':'Coach d’échecs. Français. Réponse TRÈS brève : 1 à 2 phrases (max 35 mots), directe, seulement l’essentiel.'},{role:'user',content:p}],mode)}
 /* ---- Stockfish local ---- */
 let sf,q=Promise.resolve();
-const ev=(fen,d)=>q=q.then(()=>new Promise(res=>{const c=new Chess(fen),t=fen.split(' ')[1]=='w'?1:-1;
- if(c.game_over())return res({cp:c.in_checkmate()?-10000*t:0,best:'',pv:[]});
- sf=sf||new Worker(URL.createObjectURL(new Blob(["importScripts('https://cdnjs.cloudflare.com/ajax/libs/stockfish.js/10.0.2/stockfish.js')"])));
- let s=0,pv=[];sf.onmessage=e=>{const l=String(e.data),m=l.match(/score (cp|mate) (-?\d+)/);
- if(m&&!/bound/.test(l)){const v=+m[2];s=m[1]=='cp'?v:(v>0?1:-1)*(10000-Math.abs(v)*10);const pm=l.match(/ pv (.+)/);if(pm)pv=pm[1].split(' ').slice(0,6)}
- if(l.startsWith('bestmove'))res({cp:s*t,best:l.split(' ')[1],pv})};
- sf.postMessage('position fen '+fen);sf.postMessage('go depth '+d)}));
+const HF_API='https://darkpsx-chesspro.hf.space';
+
+/* Appel API HuggingFace Stockfish (cloud, plus puissant) */
+async function evCloud(fen){
+  try{
+    const r1=await fetch(HF_API+'/call/analyze',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({data:[fen,20]})});
+    if(!r1.ok)return null;
+    const {event_id}=await r1.json();
+    const r2=await fetch(HF_API+'/call/analyze/'+event_id);
+    const txt=await r2.text();
+    const lines=txt.split('\n').filter(l=>l.startsWith('data:'));
+    for(const line of lines){
+      try{
+        const d=JSON.parse(line.slice(5).trim());
+        if(Array.isArray(d)&&d[0]&&d[0].best_move){
+          const en=d[0].eval_num||0,t=fen.split(' ')[1]=='w'?1:-1;
+          return{cp:en,best:d[0].best_move,pv:[d[0].best_move],cloud:true};
+        }
+      }catch(e){}
+    }
+  }catch(e){}
+  return null;
+}
+
+/* Évaluation locale (rapide, depth réduit) */
+function evLocal(fen,d){
+  return new Promise(res=>{
+    const c=new Chess(fen),t=fen.split(' ')[1]=='w'?1:-1;
+    if(c.game_over())return res({cp:c.in_checkmate()?-10000*t:0,best:'',pv:[]});
+    sf=sf||new Worker(URL.createObjectURL(new Blob(["importScripts('https://cdnjs.cloudflare.com/ajax/libs/stockfish.js/10.0.2/stockfish.js')"])));
+    let s=0,pv=[];sf.onmessage=e=>{const l=String(e.data),m=l.match(/score (cp|mate) (-?\d+)/);
+    if(m&&!/bound/.test(l)){const v=+m[2];s=m[1]=='cp'?v:(v>0?1:-1)*(10000-Math.abs(v)*10);const pm=l.match(/ pv (.+)/);if(pm)pv=pm[1].split(' ').slice(0,6)}
+    if(l.startsWith('bestmove'))res({cp:s*t,best:l.split(' ')[1],pv})};
+    sf.postMessage('position fen '+fen);sf.postMessage('go depth '+d);
+  });
+}
+
+/* ev() : local d'abord (rapide), cloud ensuite (précis) — résultat final = meilleur des deux */
+const ev=(fen,d)=>q=q.then(()=>new Promise(async res=>{
+  const c=new Chess(fen),t=fen.split(' ')[1]=='w'?1:-1;
+  if(c.game_over())return res({cp:c.in_checkmate()?-10000*t:0,best:'',pv:[]});
+  /* Lance local ET cloud en parallèle */
+  let done=false;
+  const localP=evLocal(fen,Math.min(d,14)).then(r=>{if(!done){done=true;res(r)}return r});
+  const cloudP=evCloud(fen).then(r=>{
+    if(r){
+      /* Le cloud a répondu — met à jour la barre d'évaluation même si local a déjà résolu */
+      if(!done){done=true;res(r)}
+      else{
+        /* Mise à jour silencieuse de la barre si déjà affiché */
+        try{setBar('ebar',r.cp);const el=document.getElementById('evl');if(el)el.textContent=fmt(r.cp)+' ☁';}catch(e){}
+      }
+    }
+  });
+  /* Timeout sécurité : 15s */
+  setTimeout(()=>{if(!done){done=true;localP.then(res)}},15000);
+}));
 /* ---- classification ---- */
 const wp=c=>50+50*(2/(1+Math.exp(-.00368208*c))-1),cl=x=>Math.max(-1000,Math.min(1000,x)),PV={p:1,n:3,b:3,r:5,q:9};
 const L={brillant:'#1baca6',meilleur:'#96bc4b',excellent:'#7fb069',bon:'#a3b18a',acceptable:'#c9b458',imprécision:'#f7c631',mauvais:'#e58f2a',erreur:'#e0662a',gaffe:'#ca3431'};
