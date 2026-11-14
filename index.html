@@ -47,7 +47,7 @@ table{width:100%;border-collapse:collapse}td,th{padding:10px 8px;border-bottom:1
 <div class="card row"><select id="src"><option>chess.com</option><option>lichess</option></select><input id="usr" placeholder="Pseudo"><button class="b" id="imp">Importer</button><input type="file" id="fil" accept=".pgn" multiple><span id="ist"></span></div>
 <div class="card row"><select id="gs" style="flex:1;min-width:200px"></select><span id="pg"></span></div>
 <div class="grid"><div><div style="display:flex;gap:8px;align-items:stretch"><div class="evalbar" id="ebar"><i></i></div><div id="wrap"><div id="bd"></div><svg id="ar" viewBox="0 0 8 8"></svg></div></div>
-<div class="row" style="margin-top:8px"><button class="b" id="f0" title="Début (Origine)">⏮</button><button class="b" id="f1" title="Coup précédent (←)">◀ Précédent</button><button class="b" id="f2" title="Coup suivant (→)">Suivant ▶</button><button class="b" id="f3" title="Fin">⏭</button><button class="b" id="fl">⇅ Retourner</button><label><input type="checkbox" id="acc"> ⏩ Accéléré</label><button class="b" id="bl">▶ Meilleure ligne</button><button class="b" id="vr">↩ Revenir</button><b id="evl"></b><span id="cloud-badge" style="display:none;background:#2563eb;color:#fff;font-size:10px;padding:2px 6px;border-radius:4px;margin-left:6px;vertical-align:middle" title="Analyse Stockfish cloud HuggingFace (depth 20+)">☁ Cloud</span></div></div>
+<div class="row" style="margin-top:8px"><button class="b" id="f0" title="Début (Origine)">⏮</button><button class="b" id="f1" title="Coup précédent (←)">◀ Précédent</button><button class="b" id="f2" title="Coup suivant (→)">Suivant ▶</button><button class="b" id="f3" title="Fin">⏭</button><button class="b" id="fl">⇅ Retourner</button><label><input type="checkbox" id="acc"> ⏩ Accéléré</label><button class="b" id="bl">▶ Meilleure ligne</button><button class="b" id="vr">↩ Revenir</button><b id="evl"></b><span id="cloud-badge" style="display:none;background:#2563eb;color:#fff;font-size:10px;padding:2px 6px;border-radius:4px;margin-left:6px;vertical-align:middle" title="Analyse Stockfish cloud HuggingFace (depth 20+)">☁ Cloud</span><select id="am" title="Mode analyse" style="margin-left:12px"><option value="both">📊 Local + Cloud</option><option value="local">🖥️ Local uniquement</option><option value="cloud">☁️ Cloud uniquement</option></select></div></div>
 <div style="flex:1;min-width:260px"><div class="card"><div id="lv"><i>Importe ou choisis une partie.</i></div><div id="tx" class="bub" style="display:none"></div><button class="b" id="ca" style="display:none">🔄 Régénérer le commentaire</button></div>
 <div class="card" id="bst" style="display:none"><b>Meilleur coup (Stockfish) : <span id="bm"></span></b><div id="bx" class="bub" style="display:none"></div><button class="b" id="ex">Expliquer</button></div>
 <div class="card" id="ml"></div></div></div></section>
@@ -227,34 +227,44 @@ function evLocal(fen,d){
   });
 }
 
-/* ev() : local d'abord (rapide), cloud ensuite (précis) — résultat final = meilleur des deux */
+/* ev() : mode analyse configurable (local, cloud ou both) */
 const ev=(fen,d)=>q=q.then(()=>new Promise(async res=>{
   const c=new Chess(fen),t=fen.split(' ')[1]=='w'?1:-1;
   if(c.game_over())return res({cp:c.in_checkmate()?-10000*t:0,best:'',pv:[]});
-  /* Lance local ET cloud en parallèle */
+  const mode=$('am').value||'both';
   let done=false;
-  const localP=evLocal(fen,Math.min(d,14)).then(r=>{if(!done){done=true;res(r)}return r});
-  const cloudP=evCloud(fen).then(r=>{
-    if(r){
-      /* Le cloud a répondu — met à jour la barre d'évaluation même si local a déjà résolu */
-      if(!done){done=true;res(r)}
-      else{
-        /* Mise à jour de la barre avec badge cloud visible */
-        try{
-          setBar('ebar',r.cp);
-          const el=document.getElementById('evl');
-          if(el)el.textContent=fmt(r.cp);
-          const badge=document.getElementById('cloud-badge');
-          if(badge)badge.style.display='inline';
-          const bm=document.getElementById('bm');
-          if(bm&&r.best)bm.innerHTML=r.best+'<span style="background:#2563eb;color:#fff;font-size:9px;padding:1px 4px;border-radius:3px;margin-left:4px">☁</span>';
-          console.log('%c☁ Cloud Stockfish (depth 20+): '+r.best+' eval='+fmt(r.cp),'color:#2563eb;font-weight:bold');
-        }catch(e){}
+  
+  if(mode==='cloud'){
+    /* Mode cloud uniquement */
+    const cloudP=evCloud(fen).then(r=>{
+      if(r){if(!done){done=true;res(r)}}else if(!done){done=true;res({cp:0,best:'',pv:[]})};
+    });
+    setTimeout(()=>{if(!done){done=true;res({cp:0,best:'',pv:[]})}},15000);
+  }else if(mode==='local'){
+    /* Mode local uniquement */
+    const localP=evLocal(fen,Math.min(d,14)).then(r=>{if(!done){done=true;res(r)}});
+    setTimeout(()=>{if(!done){done=true;localP.then(res)}},15000);
+  }else{
+    /* Mode both (défaut) : local d'abord, cloud met à jour après */
+    const localP=evLocal(fen,Math.min(d,14)).then(r=>{if(!done){done=true;res(r)}return r});
+    const cloudP=evCloud(fen).then(r=>{
+      if(r){
+        if(!done){done=true;res(r)}else{
+          try{
+            setBar('ebar',r.cp);
+            const el=document.getElementById('evl');
+            if(el)el.textContent=fmt(r.cp);
+            const badge=document.getElementById('cloud-badge');
+            if(badge)badge.style.display='inline';
+            const bm=document.getElementById('bm');
+            if(bm&&r.best)bm.innerHTML=r.best+'<span style="background:#2563eb;color:#fff;font-size:9px;padding:1px 4px;border-radius:3px;margin-left:4px">☁</span>';
+            console.log('%c☁ Cloud Stockfish (depth 20+): '+r.best+' eval='+fmt(r.cp),'color:#2563eb;font-weight:bold');
+          }catch(e){}
+        }
       }
-    }
-  });
-  /* Timeout sécurité : 15s */
-  setTimeout(()=>{if(!done){done=true;localP.then(res)}},15000);
+    });
+    setTimeout(()=>{if(!done){done=true;localP.then(res)}},15000);
+  }
 }));
 /* ---- classification ---- */
 const wp=c=>50+50*(2/(1+Math.exp(-.00368208*c))-1),cl=x=>Math.max(-1000,Math.min(1000,x)),PV={p:1,n:3,b:3,r:5,q:9};
