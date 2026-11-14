@@ -47,7 +47,7 @@ table{width:100%;border-collapse:collapse}td,th{padding:10px 8px;border-bottom:1
 <div class="card row"><select id="src"><option>chess.com</option><option>lichess</option></select><input id="usr" placeholder="Pseudo"><button class="b" id="imp">Importer</button><input type="file" id="fil" accept=".pgn" multiple><span id="ist"></span></div>
 <div class="card row"><select id="gs" style="flex:1;min-width:200px"></select><span id="pg"></span></div>
 <div class="grid"><div><div style="display:flex;gap:8px;align-items:stretch"><div class="evalbar" id="ebar"><i></i></div><div id="wrap"><div id="bd"></div><svg id="ar" viewBox="0 0 8 8"></svg></div></div>
-<div class="row" style="margin-top:8px"><button class="b" id="f0" title="Début (Origine)">⏮</button><button class="b" id="f1" title="Coup précédent (←)">◀ Précédent</button><button class="b" id="f2" title="Coup suivant (→)">Suivant ▶</button><button class="b" id="f3" title="Fin">⏭</button><button class="b" id="fl">⇅ Retourner</button><label><input type="checkbox" id="acc"> ⏩ Accéléré</label><button class="b" id="bl">▶ Meilleure ligne</button><button class="b" id="vr">↩ Revenir</button><b id="evl"></b></div></div>
+<div class="row" style="margin-top:8px"><button class="b" id="f0" title="Début (Origine)">⏮</button><button class="b" id="f1" title="Coup précédent (←)">◀ Précédent</button><button class="b" id="f2" title="Coup suivant (→)">Suivant ▶</button><button class="b" id="f3" title="Fin">⏭</button><button class="b" id="fl">⇅ Retourner</button><label><input type="checkbox" id="acc"> ⏩ Accéléré</label><button class="b" id="bl">▶ Meilleure ligne</button><button class="b" id="vr">↩ Revenir</button><b id="evl"></b><span id="cloud-badge" style="display:none;background:#2563eb;color:#fff;font-size:10px;padding:2px 6px;border-radius:4px;margin-left:6px;vertical-align:middle" title="Analyse Stockfish cloud HuggingFace (depth 20+)">☁ Cloud</span></div></div>
 <div style="flex:1;min-width:260px"><div class="card"><div id="lv"><i>Importe ou choisis une partie.</i></div><div id="tx" class="bub" style="display:none"></div><button class="b" id="ca" style="display:none">🔄 Régénérer le commentaire</button></div>
 <div class="card" id="bst" style="display:none"><b>Meilleur coup (Stockfish) : <span id="bm"></span></b><div id="bx" class="bub" style="display:none"></div><button class="b" id="ex">Expliquer</button></div>
 <div class="card" id="ml"></div></div></div></section>
@@ -243,7 +243,9 @@ const ev=(fen,d)=>q=q.then(()=>new Promise(async res=>{
         try{
           setBar('ebar',r.cp);
           const el=document.getElementById('evl');
-          if(el)el.innerHTML=fmt(r.cp)+'<span style="background:#2563eb;color:#fff;font-size:10px;padding:1px 5px;border-radius:4px;margin-left:6px;vertical-align:middle" title="Analyse Stockfish cloud (depth 20+)">☁ Cloud</span>';
+          if(el)el.textContent=fmt(r.cp);
+          const badge=document.getElementById('cloud-badge');
+          if(badge)badge.style.display='inline';
           const bm=document.getElementById('bm');
           if(bm&&r.best)bm.innerHTML=r.best+'<span style="background:#2563eb;color:#fff;font-size:9px;padding:1px 4px;border-radius:3px;margin-left:4px">☁</span>';
           console.log('%c☁ Cloud Stockfish (depth 20+): '+r.best+' eval='+fmt(r.cp),'color:#2563eb;font-weight:bold');
