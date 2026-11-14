@@ -3,7 +3,7 @@
 <style>
 :root{--bg:#FBFBFA;--c:#fff;--t:#1A1A1A;--a:#7A1F2B;--l:#ECE8DA;--d:#8C9366;--b:#1a1a1a26;--m:#6b6b66;--serif:'Fraunces',Georgia,serif;--mono:'DM Mono',ui-monospace,Menlo,Consolas,monospace}
 @media(prefers-color-scheme:dark){:root{--bg:#141413;--c:#1b1b1a;--t:#F2F0EA;--b:#f2f0ea2e;--m:#9a9890;--a:#d4707d}}
-body[data-th=bois]{--l:#f0d9b5;--d:#b58863}body[data-th=bleu]{--l:#dee3e6;--d:#6f8ea3}body[data-th=nuit]{--l:#9aa5b8;--d:#34425c}
+body[data-th=bois]{--l:#f0d9b5;--d:#b58863}body[data-th=bleu]{--l:#dee3e6;--d:#6f8ea3}body[data-th=nuit]{--l:#9aa5b8;--d:#34425c}body[data-th=ocean]{--l:#d4eaf7;--d:#3d7eaa}body[data-th=neon]{--l:#0a0a0a;--d:#0d5c0d}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--t);font:14px/1.6 var(--mono)}
 nav{display:flex;flex-wrap:wrap;align-items:baseline;gap:0 22px;padding:24px 5vw 0;border-bottom:1px solid var(--b)}
 nav b{font:600 26px/1 var(--serif);letter-spacing:.01em;text-transform:uppercase;margin-right:auto;padding-bottom:16px}
@@ -40,14 +40,38 @@ table{width:100%;border-collapse:collapse}td,th{padding:10px 8px;border-bottom:1
 .msg.sys{margin:8px auto;color:var(--m);font-size:12px;text-align:center}
 .evalbar{width:14px;background:#1a1a1a;position:relative;overflow:hidden;flex:none;border:1px solid var(--t)}
 .evalbar i{position:absolute;left:0;right:0;bottom:0;background:#f5f5f0;height:50%;transition:height .5s ease;display:block}
+/* Nouvelles fonctionnalités */
+#pvline{font:12px var(--mono);color:var(--m);padding:5px 0;min-height:18px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#advChart{width:100%;height:80px;cursor:pointer;border:1px solid var(--b);display:block;margin:6px 0}
+#trainBanner{display:none;background:#2e9e44;color:#fff;padding:7px 12px;margin:6px 0;border-radius:0;font-size:12px}
+#trainResult{font-weight:bold;padding:4px 0}
+#multiPV{display:none;margin:6px 0}
+#multiPV table{width:100%}
+#multiPV th{font:500 10px var(--mono);text-transform:uppercase;letter-spacing:.1em;color:var(--m)}
+#multiPV td{font:12px var(--mono);padding:3px 6px}
+#annotMenu{position:fixed;background:var(--c);border:1px solid var(--t);padding:4px;z-index:200;display:none;gap:4px;flex-wrap:wrap}
+#annotMenu button{background:none;border:1px solid var(--b);cursor:pointer;padding:2px 6px;font:14px var(--mono)}
+#importQuick{margin-top:12px;padding:10px 0;border-top:1px solid var(--b)}
+#importQuick input{margin:0 4px}
+#quickGames{max-height:140px;overflow:auto;margin-top:6px}
+#quickGames div{padding:3px 6px;cursor:pointer;border-bottom:1px solid var(--b)}
+#quickGames div:hover{background:var(--b)}
+#replayControls{display:none;align-items:center;gap:8px;flex-wrap:wrap;margin:4px 0}
+.annot-badge{font-size:11px;font-style:normal;color:var(--a);margin-left:2px}
 </style></head><body>
 <nav><span class="logo" aria-hidden="true"><svg viewBox="0 0 40 40" width="22" height="22"><rect x="1" y="1" width="38" height="38" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M12 30 L12 24 Q12 20 15 18 L14 16 Q13.3 15 14 14 Q15 13.3 16 14 L17.3 15.3 Q20 14 23 15 Q27 16.4 27 21 L27 30 Z M14.5 18.5 a1 1 0 1 0 2 0 a1 1 0 1 0 -2 0" fill="currentColor"/><line x1="10" y1="30" x2="29" y2="30" stroke="currentColor" stroke-width="1.6"/></svg></span><b>CHESS ANALYSIS</b><button data-t="an" class="on">Analyse</button><button data-t="su">Résumé</button><button data-t="pz">Problèmes</button><button data-t="td">À travailler</button><button data-t="jo">Jouer</button><button data-t="mm">1v1</button><button data-t="ch">Coach IA</button><button data-t="op">Ouvertures</button><button data-t="to">Outils</button><button data-t="tu">Tuto</button><button data-t="cf">Confidentialité</button><button data-t="lb">Classement</button><button data-t="ia">Fournisseurs IA</button><button data-t="pa">Paramètres</button><button data-t="ac">Compte</button><button data-t="pr">Premium</button><button data-t="sh">Boutique</button><span id="navbal" class="meta" style="align-self:center;margin-left:8px"></span><select id="im" title="Mode IA"><option value="flash">⚡ Flash (léger)</option><option value="turbo">🚀 Turbo (Groq)</option><option value="full">🧠 Complet</option></select></nav>
 <main>
 <section id="an" class="tab on">
-<div class="card row"><select id="src"><option>chess.com</option><option>lichess</option></select><input id="usr" placeholder="Pseudo"><button class="b" id="imp">Importer</button><input type="file" id="fil" accept=".pgn" multiple><span id="ist"></span></div>
+<div class="card row"><select id="src"><option>chess.com</option><option>lichess</option></select><input id="usr" placeholder="Pseudo"><button class="b" id="imp">Importer</button><input type="file" id="fil" accept=".pgn" multiple><span id="ist"></span><button class="b" id="shareBtn">🔗 Partager</button><span id="shareMsg" class="meta"></span></div>
+<div id="importQuick"><b style="font-size:11px;text-transform:uppercase;letter-spacing:.1em">Import rapide</b><div class="row" style="margin-top:6px"><select id="quickPlat"><option value="chesscom">Chess.com</option><option value="lichess">Lichess</option></select><input id="quickUser" placeholder="Pseudo" style="flex:1"><button class="b" id="quickBtn">Récupérer parties</button></div><div id="quickGames"></div></div>
 <div class="card row"><select id="gs" style="flex:1;min-width:200px"></select><span id="pg"></span></div>
 <div class="grid"><div><div style="display:flex;gap:8px;align-items:stretch"><div class="evalbar" id="ebar"><i></i></div><div id="wrap"><div id="bd"></div><svg id="ar" viewBox="0 0 8 8"></svg></div></div>
-<div class="row" style="margin-top:8px"><button class="b" id="f0" title="Début (Origine)">⏮</button><button class="b" id="f1" title="Coup précédent (←)">◀ Précédent</button><button class="b" id="f2" title="Coup suivant (→)">Suivant ▶</button><button class="b" id="f3" title="Fin">⏭</button><button class="b" id="fl">⇅ Retourner</button><label><input type="checkbox" id="acc"> ⏩ Accéléré</label><button class="b" id="bl">▶ Meilleure ligne</button><button class="b" id="vr">↩ Revenir</button><b id="evl"></b><span id="cloud-badge" style="display:none;background:#2563eb;color:#fff;font-size:10px;padding:2px 6px;border-radius:4px;margin-left:6px;vertical-align:middle" title="Analyse Stockfish cloud HuggingFace (depth 20+)">☁ Cloud</span><select id="sfmode" style="margin-left:12px;border:1px solid var(--t)"><option value="both">📊 Local + Cloud</option><option value="local">🖥️ Local seul</option><option value="cloud">☁️ Cloud seul</option></select></div></div>
+<div class="row" style="margin-top:8px"><button class="b" id="f0" title="Début (Origine)">⏮</button><button class="b" id="f1" title="Coup précédent (←)">◀ Précédent</button><button class="b" id="f2" title="Coup suivant (→)">Suivant ▶</button><button class="b" id="f3" title="Fin">⏭</button><button class="b" id="fl">⇅ Retourner</button><label><input type="checkbox" id="acc"> ⏩ Accéléré</label><button class="b" id="bl">▶ Meilleure ligne</button><button class="b" id="vr">↩ Revenir</button><b id="evl"></b><span id="cloud-badge" style="display:none;background:#2563eb;color:#fff;font-size:10px;padding:2px 6px;border-radius:4px;margin-left:6px;vertical-align:middle" title="Analyse Stockfish cloud HuggingFace (depth 20+)">☁ Cloud</span><select id="sfmode" style="margin-left:12px;border:1px solid var(--t)"><option value="both">📊 Local + Cloud</option><option value="local">🖥️ Local seul</option><option value="cloud">☁️ Cloud seul</option></select><button class="b" id="trainBtn">🎯 Entraînement</button><button class="b" id="replayBtn">▶ Auto-replay</button></div>
+<div id="trainBanner">🎯 Mode Entraînement actif — joue ton coup, puis compare avec Stockfish !<div id="trainResult"></div></div>
+<div id="replayControls"><button class="b" id="replayPause">⏸ Pause</button><label>Vitesse : <input type="range" id="replaySpeed" min="0.5" max="3" step="0.5" value="1" style="width:80px"> <span id="replaySpeedVal">1x</span></label></div>
+<div id="pvline"></div>
+<canvas id="advChart"></canvas>
+<div id="multiPV"><table><thead><tr><th>#</th><th>Coup</th><th>Éval</th><th>Info</th></tr></thead><tbody id="multiPVbody"></tbody></table></div></div>
 <div style="flex:1;min-width:260px"><div class="card"><div id="lv"><i>Importe ou choisis une partie.</i></div><div id="tx" class="bub" style="display:none"></div><button class="b" id="ca" style="display:none">🔄 Régénérer le commentaire</button></div>
 <div class="card" id="bst" style="display:none"><b>Meilleur coup (Stockfish) : <span id="bm"></span></b><div id="bx" class="bub" style="display:none"></div><button class="b" id="ex">Expliquer</button></div>
 <div class="card" id="ml"></div></div></div></section>
@@ -110,10 +134,19 @@ table{width:100%;border-collapse:collapse}td,th{padding:10px 8px;border-bottom:1
 <div class="card"><h3>Aucune publicité, aucun traqueur</h3><p>Ce site ne contient aucun service de publicité ni d’analytics tiers. Les seules requêtes externes sont celles décrites ci-dessus.</p></div>
 <div class="card"><h3>Suppression de tes données</h3><p>Tu peux à tout moment vider le stockage local depuis les réglages de ton navigateur, ou nous contacter pour supprimer ton compte en ligne et les données associées.</p></div></section>
 <section id="tu" class="tab"><div class="card"><h3>Créer une clé OpenRouter (gratuit)</h3><ol><li>Va sur <a href="https://openrouter.ai" target="_blank">openrouter.ai</a> et crée un compte.</li><li>Menu <b>Keys</b> → <b>Create Key</b>, copie la clé (sk-or-…).</li><li>Ouvre l’onglet <b>Fournisseurs IA</b>, colle la clé dans la ligne OpenRouter puis clique « ↻ Modèles » et choisis un modèle <code>:free</code>.</li><li>Ajoute d’autres fournisseurs (Groq, etc.) : ils servent de secours si une limite est atteinte.</li></ol><p>La clé reste dans ton navigateur et n’est envoyée qu’à OpenRouter.</p></div></section>
-<section id="pa" class="tab"><div class="card"><h3>Réglages</h3><div class="row"><label>Profondeur Stockfish <input id="cd" type="number" min="6" max="20" style="width:70px"></label><label>Nb parties importées <input id="cn" type="number" min="1" max="50" style="width:70px"></label><label>Ton pseudo <input id="cu"></label><label>Ton Elo <input id="ce" type="number" style="width:80px"></label><label>Commentaires pré-générés (coups) <input id="cp" type="number" min="0" max="10" style="width:70px"></label><label>Thème <select id="cth"><option value="vert">Vert</option><option value="bois">Bois</option><option value="bleu">Bleu</option><option value="nuit">Nuit</option></select></label><label>Coordonnées <select id="cco"><option value="1">Afficher</option><option value="0">Masquer</option></select></label><label>Sons <select id="csx"><option value="1">Activés</option><option value="0">Coupés</option></select></label><label>Mode dynamique <select id="cdy"><option value="0">Non</option><option value="1">Oui</option></select></label><label>Commentaires automatiques <select id="cac"><option value="1">Générer automatiquement</option><option value="0">Manuel (bouton)</option></select></label></div><button class="b" id="cs" style="margin-top:8px">Enregistrer</button></div>
+<section id="pa" class="tab"><div class="card"><h3>Réglages</h3><div class="row"><label>Profondeur Stockfish <input id="cd" type="number" min="6" max="20" style="width:70px"></label><label>Nb parties importées <input id="cn" type="number" min="1" max="50" style="width:70px"></label><label>Ton pseudo <input id="cu"></label><label>Ton Elo <input id="ce" type="number" style="width:80px"></label><label>Commentaires pré-générés (coups) <input id="cp" type="number" min="0" max="10" style="width:70px"></label><label>Thème <select id="cth"><option value="vert">Vert</option><option value="bois">Bois</option><option value="bleu">Bleu</option><option value="nuit">Nuit</option><option value="ocean">Océan</option><option value="neon">Néon</option></select></label><label>Coordonnées <select id="cco"><option value="1">Afficher</option><option value="0">Masquer</option></select></label><label>Sons <select id="csx"><option value="1">Activés</option><option value="0">Coupés</option></select></label><label>Mode dynamique <select id="cdy"><option value="0">Non</option><option value="1">Oui</option></select></label><label>Commentaires automatiques <select id="cac"><option value="1">Générer automatiquement</option><option value="0">Manuel (bouton)</option></select></label></div><button class="b" id="cs" style="margin-top:8px">Enregistrer</button></div>
 <div class="card"><h3>Données</h3><button class="b" id="xp">Exporter JSON</button> <input type="file" id="xi" accept=".json"></div>
 </section>
 </main>
+<div id="annotMenu">
+  <button onclick="setAnnot('!!')">!! Brillant</button>
+  <button onclick="setAnnot('!')">! Bon</button>
+  <button onclick="setAnnot('!?')">!? Intéressant</button>
+  <button onclick="setAnnot('?!')">?! Douteux</button>
+  <button onclick="setAnnot('?')">? Erreur</button>
+  <button onclick="setAnnot('??')">?? Gaffe</button>
+  <button onclick="setAnnot('')">✕ Effacer</button>
+</div>
 <script>
 const $=i=>document.getElementById(i),S={games:[],g:null,ply:0,flip:false};
 let st={};try{st=JSON.parse(localStorage.ea||'{}')}catch(e){}
@@ -288,13 +321,14 @@ async function srcHF(url,fen,timeoutMs,externalCtrl){
    SOURCE 3 : chess-api.com WebSocket — une seule connexion depth 20
    Les messages intermédiaires (type:"move") donnent les profondeurs 12/15/18 au fur et à mesure.
    ================================================================ */
-function srcChessApiWS(fen,_depth,timeoutMs){
+function srcChessApiWS(fen,_depth,timeoutMs,variants){
+  variants=variants||1;
   return new Promise(res=>{
-    let best=null,done=false;
+    let best=null,done=false,multiResults=[];
     const tid=setTimeout(()=>{if(!done){done=true;res(best)}},timeoutMs);
     try{
       const ws=new WebSocket('wss://chess-api.com/v1');
-      ws.onopen=()=>ws.send(JSON.stringify({fen,depth:20,maxThinkingTime:100,variants:1}));
+      ws.onopen=()=>ws.send(JSON.stringify({fen,depth:20,maxThinkingTime:100,variants}));
       ws.onmessage=e=>{
         try{
           const j=JSON.parse(e.data);
@@ -302,9 +336,15 @@ function srcChessApiWS(fen,_depth,timeoutMs){
           const mv=j.move||j.from+j.to+(j.promotion||'');
           if(!mv)return;
           const cp=normCp(j);
-          const r={cp,best:mv,evaluation:cpStr(cp),depth:j.depth||20,cloud:true,source:'chess-api'};
+          const r={cp,best:mv,evaluation:cpStr(cp),depth:j.depth||20,cloud:true,source:'chess-api',pv:j.pv||''};
           updateCloudUI(r);best=r;
-          if(j.type==='bestmove'&&!done){done=true;clearTimeout(tid);ws.close();res(best)}
+          /* Collecter les variantes multi-PV */
+          if(j.id!=null){while(multiResults.length<=j.id)multiResults.push(null);multiResults[j.id]=r}
+          if(j.type==='bestmove'&&!done){
+            done=true;clearTimeout(tid);ws.close();
+            if(multiResults.filter(Boolean).length>1)updateMultiPV(multiResults.filter(Boolean));
+            res(best);
+          }
         }catch(err){}
       };
       ws.onerror=()=>{if(!done){done=true;clearTimeout(tid);res(best)}};
@@ -406,7 +446,7 @@ function evCloud(fen){
     /* HF Node 1 (streaming SSE depth 15) — avec AbortController */
     sources.push(srcHF(HF_NODES[1],fen,TO,hfCtrls[1]));
     /* chess-api WS depth 20 — une seule connexion avec résultats progressifs */
-    sources.push(srcChessApiWS(fen,20,TO));
+    sources.push(srcChessApiWS(fen,20,TO,3));
     /* stockfish.online depth 15 */
     sources.push(srcStockfishOnline(fen,8000));
     /* lichess déjà lancé séparément */
@@ -443,11 +483,16 @@ const ev=(fen,d)=>q=q.then(()=>new Promise(async res=>{
   let done=false;
   
   if(mode==='cloud'){
-    /* Mode cloud uniquement */
-    const cloudP=evCloud(fen).then(r=>{
-      if(r){if(!done){done=true;res(r)}}else if(!done){done=true;res({cp:0,best:'',pv:[]})};
+    /* Mode cloud : local tourne toujours en arrière-plan pour affichage immédiat */
+    evLocal(fen,Math.min(d,14)).then(r=>{if(r&&!done){done=true;res(r)}});
+    evCloud(fen).then(r=>{
+      if(r){
+        /* Cloud met à jour l'UI même si local a déjà résolu la promesse */
+        updateCloudUI(r);
+        if(!done){done=true;res(r)}
+      }else if(!done){done=true;res({cp:0,best:'',pv:[]})}
     });
-    setTimeout(()=>{if(!done){done=true;res({cp:0,best:'',pv:[]})}},9000);
+    setTimeout(()=>{if(!done){done=true;res({cp:0,best:'',pv:[]})}},9500);
   }else if(mode==='local'){
     /* Mode local uniquement */
     const localP=evLocal(fen,Math.min(d,14)).then(r=>{if(!done){done=true;res(r)}});
@@ -758,4 +803,330 @@ drawChat();
 document.addEventListener('keydown',e=>{const k=e.key.toLowerCase();if((e.ctrlKey||e.metaKey)&&(k=='u'||(e.shiftKey&&['i','j','c'].includes(k)))||k=='f12')e.preventDefault()});
 document.addEventListener('contextmenu',e=>e.preventDefault());
 rend();
+
+/* ================================================================
+   NOUVELLES FONCTIONNALITÉS
+   ================================================================ */
+
+/* ---- 1. Flèches PV variantes sur l'échiquier ---- */
+/* La fonction arrow() existante génère du SVG. On l'étend pour afficher les variantes PV en gris */
+const _origRend=rend;
+rend=function(){
+  _origRend();
+  drawPVArrows();
+  updateAdvChart();
+};
+function drawPVArrows(){
+  const g=S.g,p=S.ply,ar=$('ar');if(!ar)return;
+  if(!g||S.v)return;
+  const evAt=g.ev&&g.ev[p];if(!evAt||!evAt.pv||!evAt.pv.length)return;
+  /* Flèche verte du meilleur coup courant (position p) */
+  let svgExtra='';
+  const best=evAt.best;
+  if(best&&p==S.ply){svgExtra+=arrow(best,'#2e9e44')}
+  /* Variantes PV en gris */
+  evAt.pv.slice(1,4).forEach(u=>{if(u&&u.length>=4)svgExtra+=arrow(u,'#88888866')});
+  /* On fusionne avec le contenu existant uniquement si différent */
+  if(svgExtra){const cur=ar.innerHTML;if(!cur.includes(svgExtra.slice(0,20)))ar.innerHTML=svgExtra}
+}
+
+/* ---- 2. Affichage ligne principale PV ---- */
+function updatePVLine(){
+  const g=S.g,p=S.ply,el=$('pvline');if(!el)return;
+  if(!g||!g.ev||!g.ev[p]){el.textContent='';return}
+  const evAt=g.ev[p];if(!evAt||!evAt.pv||!evAt.pv.length){el.textContent='';return}
+  const fen=g.fens[p];
+  const c=new Chess(fen);
+  const pvMoves=evAt.pv.slice(0,6);
+  const sanMoves=[];
+  for(const u of pvMoves){
+    try{const m=c.move({from:u.slice(0,2),to:u.slice(2,4),promotion:u[4]||'q'});if(m)sanMoves.push(m.san);else break}catch(e){break}
+  }
+  el.textContent='Meilleure ligne : '+(sanMoves.join(' ')||evAt.pv.slice(0,6).join(' '));
+}
+
+/* Patch de rend pour mettre à jour la PV line aussi */
+const _rendOrig2=rend;
+rend=function(){
+  _rendOrig2();
+  updatePVLine();
+};
+
+/* ---- 3. Graphique d'avantage sur toute la partie ---- */
+function updateAdvChart(){
+  const cv=$('advChart');if(!cv)return;
+  const g=S.g;
+  if(!g||!g.ev||g.ev.length<2){const ctx2=cv.getContext('2d');ctx2.clearRect(0,0,cv.width,cv.height);return}
+  const W=cv.clientWidth||400,H=80;
+  cv.width=W;cv.height=H;
+  const ctx2=cv.getContext('2d');
+  const dk=matchMedia('(prefers-color-scheme:dark)').matches;
+  ctx2.clearRect(0,0,W,H);
+  /* Fond */
+  ctx2.fillStyle=dk?'#1a1a1a':'#f5f5f5';ctx2.fillRect(0,0,W,H);
+  /* Ligne zéro */
+  ctx2.strokeStyle=dk?'#444':'#ccc';ctx2.lineWidth=1;
+  ctx2.beginPath();ctx2.moveTo(0,H/2);ctx2.lineTo(W,H/2);ctx2.stroke();
+  /* Courbe */
+  const evals=g.ev.map(e=>e?Math.max(-800,Math.min(800,e.cp)):0);
+  const n=evals.length;if(n<2)return;
+  ctx2.beginPath();
+  for(let i=0;i<n;i++){
+    const x=i/(n-1)*W,y=H/2-(evals[i]/800)*(H/2-4);
+    i===0?ctx2.moveTo(x,y):ctx2.lineTo(x,y);
+  }
+  ctx2.strokeStyle='#2e9e44';ctx2.lineWidth=2;ctx2.stroke();
+  /* Remplissage blanc au-dessus de 0, noir en-dessous */
+  for(let i=0;i<n-1;i++){
+    const x1=i/(n-1)*W,x2=(i+1)/(n-1)*W;
+    const y1=H/2-(evals[i]/800)*(H/2-4),y2=H/2-(evals[i+1]/800)*(H/2-4);
+    ctx2.beginPath();ctx2.moveTo(x1,H/2);ctx2.lineTo(x1,y1);ctx2.lineTo(x2,y2);ctx2.lineTo(x2,H/2);ctx2.closePath();
+    ctx2.fillStyle=evals[i]>=0?(dk?'rgba(255,255,255,0.15)':'rgba(255,255,255,0.6)'):(dk?'rgba(0,0,0,0.3)':'rgba(0,0,0,0.15)');
+    ctx2.fill();
+  }
+  /* Curseur position actuelle */
+  if(S.ply>=0&&S.ply<n){
+    const cx=S.ply/(n-1)*W;
+    ctx2.strokeStyle=dk?'#f00':'#c00';ctx2.lineWidth=1.5;
+    ctx2.beginPath();ctx2.moveTo(cx,0);ctx2.lineTo(cx,H);ctx2.stroke();
+  }
+}
+/* Clic sur le graphique → naviguer au coup */
+$('advChart').addEventListener('click',function(e){
+  const g=S.g;if(!g||!g.ev)return;
+  const W=this.clientWidth,n=g.ev.length;
+  const frac=e.offsetX/W;
+  const idx=Math.round(frac*(n-1));
+  go(Math.max(0,Math.min(g.moves.length,idx)));
+});
+
+/* ---- 4. Mode Entraînement ---- */
+let trainMode=false,trainBestMove=null,trainPlyStart=0;
+$('trainBtn').onclick=()=>{
+  trainMode=!trainMode;
+  $('trainBanner').style.display=trainMode?'':'none';
+  $('trainBtn').textContent=trainMode?'❌ Quitter entraînement':'🎯 Entraînement';
+  $('trainResult').textContent='';
+  if(trainMode&&S.g&&S.g.ev&&S.g.ev[S.ply]){
+    trainBestMove=S.g.ev[S.ply].best;trainPlyStart=S.ply;
+  }
+};
+/* Intercepter les coups en mode entraînement via le patch de pa() */
+const _origPa=window.pa;
+pa=function(s){
+  if(trainMode&&S.g&&!S.v){
+    const g=S.g,p=S.ply,evData=g.ev&&g.ev[p];
+    if(S.sel&&S.sel!=s){
+      const c=new Chess(g.fens[p]);
+      const mv=c.moves({verbose:true}).find(x=>x.from==S.sel&&x.to==s);
+      if(mv&&evData&&evData.best){
+        const played=S.sel+s+(mv.promotion||'');
+        const best=evData.best;
+        c.move({from:mv.from,to:mv.to,promotion:'q'});
+        S.v=c;S.sel=null;moveSnd(mv);
+        /* Évaluer le coup joué */
+        const prevCp=g.ev[p]?g.ev[p].cp:0;
+        const col=mv.color=='w'?1:-1;
+        const wa=wp(prevCp*col);
+        ev(c.fen(),8).then(ne=>{
+          const wb=wp(ne.cp*col);
+          const loss=Math.max(0,wa-wb);
+          let badge,color;
+          if(played===best){badge='✅ Meilleur coup !';color='#2e9e44'}
+          else if(loss<3){badge='✅ Excellent !';color='#7fb069'}
+          else if(loss<10){badge='🟡 Imprécision (perte '+loss.toFixed(1)+'%)';color='#f7c631'}
+          else if(loss<20){badge='🟠 Mauvais coup (perte '+loss.toFixed(1)+'%)';color='#e58f2a'}
+          else{badge='🔴 Erreur (perte '+loss.toFixed(1)+'%)';color='#ca3431'}
+          const bs=best?sans(g.fens[p],best):'';
+          $('trainResult').innerHTML=`<span style="color:${color}">${badge}</span>${bs&&played!==best?` — Meilleur : <b>${bs}</b>`:''}`;
+        });
+        rend();return;
+      }
+    }
+  }
+  _origPa(s);
+};
+
+/* ---- 5. Partage par lien URL ---- */
+$('shareBtn').onclick=()=>{
+  const g=S.g;
+  let fen='';
+  if(g)fen=g.fens[S.ply]||g.fens[0];
+  else fen='rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1';
+  const url=location.href.split('?')[0]+'?fen='+encodeURIComponent(fen);
+  navigator.clipboard.writeText(url).then(()=>{
+    $('shareMsg').textContent='✅ Lien copié !';
+    setTimeout(()=>$('shareMsg').textContent='',2500);
+  }).catch(()=>{
+    prompt('Copie ce lien :',url);
+  });
+};
+/* Au chargement : lire ?fen= dans l'URL */
+(function(){
+  const params=new URLSearchParams(location.search);
+  const fen=params.get('fen');
+  if(!fen)return;
+  try{
+    const c=new Chess(fen);if(!c)return;
+    /* Créer une "partie" minimale avec juste cette position */
+    const pgn=`[Event "Position partagée"]\n[Date "${new Date().toISOString().slice(0,10).replace(/-/g,'.')}"]\n[White "?"]\n[Black "?"]\n[Result "*"]\n\n*`;
+    const g={pgn,h:{Event:'Position partagée',White:'?',Black:'?',Result:'*'},moves:[],fens:[fen],clk:[],label:'Position partagée'};
+    S.games.push(g);
+    setTimeout(()=>{
+      $('gs').innerHTML=S.games.map((gx,i)=>`<option value="${i}">${gx.label}</option>`).join('');
+      pick(S.games.length-1);
+    },500);
+  }catch(e){}
+})();
+
+/* ---- 6. Thèmes d'échiquier (déjà géré via cfg.theme + data-th sur body) ---- */
+/* Les thèmes ocean et neon sont ajoutés dans le CSS et dans le select Paramètres */
+
+/* ---- 7. Annotation manuelle des coups ---- */
+const annotations={};/* {plyIndex: '!', '?', etc.} */
+let annotTargetPly=null;
+document.getElementById('annotMenu').style.display='none';
+function showAnnotMenu(e,ply){
+  annotTargetPly=ply;
+  const m=$('annotMenu');
+  m.style.display='flex';
+  m.style.left=(e.clientX+4)+'px';
+  m.style.top=(e.clientY+4)+'px';
+  e.stopPropagation();
+}
+function setAnnot(sym){
+  if(annotTargetPly!=null){
+    if(sym)annotations[annotTargetPly]=sym;
+    else delete annotations[annotTargetPly];
+  }
+  $('annotMenu').style.display='none';
+  renderAnnotations();
+}
+document.addEventListener('click',()=>$('annotMenu').style.display='none');
+function renderAnnotations(){
+  /* Ajouter les badges d'annotation sur les boutons de coups */
+  document.querySelectorAll('#ml .mv').forEach(btn=>{
+    const ply=parseInt(btn.getAttribute('onclick').match(/go\((\d+)\)/)?.[1]);
+    if(!ply)return;
+    const existing=btn.querySelector('.annot-badge');
+    if(existing)existing.remove();
+    if(annotations[ply]){
+      const sp=document.createElement('i');sp.className='annot-badge';sp.textContent=annotations[ply];
+      btn.appendChild(sp);
+    }
+    /* Ajout du menu contextuel */
+    btn.oncontextmenu=(e)=>{e.preventDefault();showAnnotMenu(e,ply)};
+  });
+}
+/* Patch rend pour appliquer les annotations après chaque rendu */
+const _rendOrig3=rend;
+rend=function(){
+  _rendOrig3();
+  setTimeout(renderAnnotations,0);
+};
+
+/* ---- 8. Replay automatique ---- */
+let replayTimer=null,replayRunning=false;
+$('replayBtn').onclick=()=>{
+  const ctrl=$('replayControls');
+  if(replayRunning){clearInterval(replayTimer);replayRunning=false;$('replayPause').textContent='⏸ Pause';ctrl.style.display='none';$('replayBtn').textContent='▶ Auto-replay';return}
+  if(!S.g)return;
+  ctrl.style.display='flex';$('replayBtn').textContent='⏹ Arrêter';
+  go(0);startReplay();
+};
+function startReplay(){
+  const speed=parseFloat($('replaySpeed').value)||1;
+  const delay=Math.round(1000/speed);
+  replayRunning=true;$('replayPause').textContent='⏸ Pause';
+  replayTimer=setInterval(()=>{
+    if(!replayRunning)return;
+    const g=S.g;if(!g||S.ply>=g.moves.length){clearInterval(replayTimer);replayRunning=false;$('replayBtn').textContent='▶ Auto-replay';$('replayControls').style.display='none';return}
+    nav(1);
+  },delay);
+}
+$('replayPause').onclick=()=>{
+  if(replayRunning){clearInterval(replayTimer);replayRunning=false;$('replayPause').textContent='▶ Reprendre'}
+  else{startReplay();$('replayPause').textContent='⏸ Pause'}
+};
+$('replaySpeed').oninput=function(){
+  $('replaySpeedVal').textContent=this.value+'x';
+  if(replayRunning){clearInterval(replayTimer);startReplay()}
+};
+
+/* ---- 9. Import rapide Chess.com/Lichess par username ---- */
+$('quickBtn').onclick=async()=>{
+  const user=$('quickUser').value.trim();
+  const plat=$('quickPlat').value;
+  const container=$('quickGames');
+  if(!user){container.innerHTML='<div>Saisis un pseudo.</div>';return}
+  container.innerHTML='<div>Chargement…</div>';
+  try{
+    let games=[];
+    if(plat==='lichess'){
+      const resp=await fetch(`https://lichess.org/api/games/user/${encodeURIComponent(user)}?max=10`,{headers:{Accept:'application/x-chess-pgn'}});
+      if(!resp.ok)throw new Error('Lichess : '+resp.status);
+      const text=await resp.text();
+      games=text.split(/\n\n(?=\[Event )/).filter(x=>x.trim()).slice(0,10).map(pgn=>{
+        const wm=pgn.match(/\[White "([^"]+)"\]/),blm=pgn.match(/\[Black "([^"]+)"\]/),rm=pgn.match(/\[Result "([^"]+)"\]/);
+        return{pgn,label:`${wm?wm[1]:'?'} vs ${blm?blm[1]:'?'} (${rm?rm[1]:'*'})`};
+      });
+    }else{
+      const now=new Date();
+      const url=`https://api.chess.com/pub/player/${encodeURIComponent(user.toLowerCase())}/games/${now.getFullYear()}/${String(now.getMonth()+1).padStart(2,'0')}`;
+      const resp=await fetch(url);
+      if(!resp.ok)throw new Error('Chess.com : '+resp.status);
+      const data=await resp.json();
+      games=(data.games||[]).reverse().slice(0,10).map(g=>({pgn:g.pgn,label:`${g.white.username} vs ${g.black.username} (${g.pgn.match(/\[Result "([^"]+)"\]/)?.[1]||'*'})`}));
+    }
+    if(!games.length){container.innerHTML='<div>Aucune partie trouvée.</div>';return}
+    container.innerHTML=games.map((g,i)=>`<div data-qi="${i}">${g.label}</div>`).join('');
+    container.querySelectorAll('[data-qi]').forEach(el=>{
+      el.onclick=()=>{
+        const idx=+el.dataset.qi;
+        const n=add([games[idx].pgn]);
+        $('ist').textContent=n?'Partie importée ✔':'Partie déjà présente';
+        if(n&&S.games.length)pick(S.games.length-1);
+      };
+    });
+  }catch(e){container.innerHTML='<div>Erreur : '+esc(e.message)+'</div>'}
+};
+
+/* ---- 10. Affichage multi-variantes top 3 ---- */
+function updateMultiPV(variants){
+  const el=$('multiPV'),tbody=$('multiPVbody');if(!el||!tbody)return;
+  if(!variants||!variants.length){el.style.display='none';return}
+  el.style.display='';
+  const fen=S.g?S.g.fens[S.ply]:(S.v?S.v.fen():'');
+  tbody.innerHTML=variants.slice(0,3).map((v,i)=>{
+    const moveStr=v.best?`<b>${fen?sans(fen,v.best):v.best}</b>`:'—';
+    return`<tr><td>${i+1}</td><td>${moveStr}</td><td>${v.evaluation||'—'}</td><td style="color:var(--m);font-size:11px">${v.source||'cloud'}</td></tr>`;
+  }).join('');
+}
+/* Afficher les multiPV lors des mises à jour cloud */
+const _origUpdateCloudUI=updateCloudUI;
+updateCloudUI=function(r){
+  _origUpdateCloudUI(r);
+  /* Mettre à jour la ligne PV */
+  if(r&&r.pv){
+    const pvEl=$('pvline');
+    if(pvEl&&r.pv){
+      const pvMoves=r.pv.trim().split(' ').slice(0,6);
+      if(pvMoves.length){
+        const fen=S.g?S.g.fens[S.ply]:(S.v?S.v.fen():'');
+        let sanStr='';
+        if(fen){try{const c=new Chess(fen);sanStr=pvMoves.map(u=>{const m=c.move({from:u.slice(0,2),to:u.slice(2,4),promotion:u[4]||'q'});return m?m.san:u}).join(' ')}catch(e){sanStr=pvMoves.join(' ')}}
+        else sanStr=pvMoves.join(' ');
+        pvEl.textContent='Meilleure ligne (cloud) : '+sanStr;
+      }
+    }
+    /* Dessiner flèches PV cloud */
+    if(r.pv&&$('ar')){
+      const pvArr=r.pv.trim().split(' ');
+      let svgContent=arrow(r.best,'#2e9e44');
+      pvArr.slice(1,4).forEach(u=>{if(u&&u.length>=4)svgContent+=arrow(u,'#88888866')});
+      $('ar').innerHTML=svgContent;
+    }
+  }
+};
+
 </script></body></html>
