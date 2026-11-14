@@ -195,10 +195,10 @@ const HF_API='https://darkpsx-chesspro.hf.space';
 /* Appel API HuggingFace Stockfish (cloud, plus puissant) */
 async function evCloud(fen){
   try{
-    const r1=await fetch(HF_API+'/call/analyze',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({data:[fen,20]})});
+    const r1=await fetch(HF_API+'/gradio_api/call/analyze',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({data:[fen,20]})});
     if(!r1.ok)return null;
     const {event_id}=await r1.json();
-    const r2=await fetch(HF_API+'/call/analyze/'+event_id);
+    const r2=await fetch(HF_API+'/gradio_api/call/analyze/'+event_id);
     const txt=await r2.text();
     const lines=txt.split('\n').filter(l=>l.startsWith('data:'));
     for(const line of lines){
