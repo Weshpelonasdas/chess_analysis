@@ -203,13 +203,11 @@ const HF_NODES=[
 ];
 const HF_LAT=HF_NODES.map(()=>9999);
 
-/* Warmup HF nodes au démarrage + toutes les 4 min */
+/* Warmup HF nodes au démarrage + toutes les 4 min — simple GET sur / pour réveiller le Space sans consommer de quota GPU */
 (function warmup(){
-  const INIT_FEN='rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1';
   HF_NODES.forEach((url,i)=>{
     const t0=Date.now();
-    fetch(url+'/gradio_api/call/analyze',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({data:[INIT_FEN,1]})})
-      .then(r=>r.json()).then(({event_id})=>fetch(url+'/gradio_api/call/analyze/'+event_id))
+    fetch(url+'/',{method:'GET',cache:'no-store'})
       .then(()=>{HF_LAT[i]=Date.now()-t0;console.log('%c\u2601 HF'+i+' ready ('+HF_LAT[i]+'ms)','color:#22c55e')})
       .catch(()=>{});
   });
@@ -224,9 +222,9 @@ function updateCloudUI(r){
   if(d<_cbd)return; /* ignorer si moins profond */
   _cbd=d;
   try{
-    if(r.evaluation){const el=document.getElementById('evl');if(el)el.textContent=r.evaluation+'  d'+d}
+    if(r.evaluation){const el=document.getElementById('evl');if(el)el.textContent=r.evaluation+' (p'+d+')'}
     const badge=document.getElementById('cloud-badge');if(badge)badge.style.display='inline';
-    if(r.best){const bm=document.getElementById('bm');if(bm)bm.innerHTML=r.best+'<span style="background:#2563eb;color:#fff;font-size:9px;padding:1px 4px;border-radius:3px;margin-left:4px">\u2601 d'+d+'</span>'}
+    if(r.best){const bm=document.getElementById('bm');if(bm)bm.innerHTML=r.best+'<span style="background:#2563eb;color:#fff;font-size:9px;padding:1px 4px;border-radius:3px;margin-left:4px">\u2601 p'+d+'</span>'}
     if(r.cp!=null){try{setBar('ebar',r.cp)}catch(e){}}
   }catch(e){}
 }
@@ -250,8 +248,8 @@ function normCp(j,side){
 /* ================================================================
    SOURCE 1 & 2 : HF Nodes — SSE streaming progressif
    ================================================================ */
-async function srcHF(url,fen,timeoutMs){
-  const ctrl=new AbortController(),tid=setTimeout(()=>ctrl.abort(),timeoutMs);
+async function srcHF(url,fen,timeoutMs,externalCtrl){
+  const ctrl=externalCtrl||new AbortController(),tid=setTimeout(()=>ctrl.abort(),timeoutMs);
   const t0=Date.now();let best=null;
   try{
     const r1=await fetch(url+'/gradio_api/call/analyze',{method:'POST',
@@ -287,24 +285,24 @@ async function srcHF(url,fen,timeoutMs){
 }
 
 /* ================================================================
-   SOURCE 3 : chess-api.com WebSocket — streaming live progressif
-   depth 12, 18 et 20 en 3 connexions séparées
+   SOURCE 3 : chess-api.com WebSocket — une seule connexion depth 20
+   Les messages intermédiaires (type:"move") donnent les profondeurs 12/15/18 au fur et à mesure.
    ================================================================ */
-function srcChessApiWS(fen,depth,timeoutMs){
+function srcChessApiWS(fen,_depth,timeoutMs){
   return new Promise(res=>{
     let best=null,done=false;
     const tid=setTimeout(()=>{if(!done){done=true;res(best)}},timeoutMs);
     try{
       const ws=new WebSocket('wss://chess-api.com/v1');
-      ws.onopen=()=>ws.send(JSON.stringify({fen,depth,maxThinkingTime:100,variants:1}));
+      ws.onopen=()=>ws.send(JSON.stringify({fen,depth:20,maxThinkingTime:100,variants:1}));
       ws.onmessage=e=>{
         try{
           const j=JSON.parse(e.data);
-          if(!j||!j.move&&!j.from)return;
+          if(!j||(!j.move&&!j.from))return;
           const mv=j.move||j.from+j.to+(j.promotion||'');
           if(!mv)return;
           const cp=normCp(j);
-          const r={cp,best:mv,evaluation:cpStr(cp),depth:j.depth||depth,cloud:true,source:'chess-api'};
+          const r={cp,best:mv,evaluation:cpStr(cp),depth:j.depth||20,cloud:true,source:'chess-api'};
           updateCloudUI(r);best=r;
           if(j.type==='bestmove'&&!done){done=true;clearTimeout(tid);ws.close();res(best)}
         }catch(err){}
@@ -352,42 +350,75 @@ async function srcLichessCloud(fen,timeoutMs){
 }
 
 /* ================================================================
-   evCloud : toutes sources en parallèle, chacune sur son propre coup
+   evCloud : cache FEN + Lichess en premier + abort HF si bonne réponse rapide
    ================================================================ */
+const _cache=new Map(); /* cache FEN -> {result, ts} */
+const _CACHE_TTL=300000; /* 5 minutes */
+
 function evCloud(fen){
   resetCloudState();
+  /* Vérifier le cache */
+  const cached=_cache.get(fen);
+  if(cached&&(Date.now()-cached.ts)<_CACHE_TTL){
+    console.log('%c☁ Cache hit pour FEN (depth '+cached.result.depth+')','color:#a855f7');
+    updateCloudUI(cached.result);
+    return Promise.resolve(cached.result);
+  }
   const TO=9000; /* timeout global */
   return new Promise(res=>{
-    const sources=[];
     let settled=0,bestResult=null,resolved=false;
+    /* AbortControllers pour annuler les requêtes HF si une bonne réponse arrive tôt */
+    const hfCtrls=[new AbortController(),new AbortController()];
+    const t0=Date.now();
 
-    /* HF Node 0 (streaming SSE depth 15) */
-    sources.push(srcHF(HF_NODES[0],fen,TO));
-    /* HF Node 1 (streaming SSE depth 15) */
-    sources.push(srcHF(HF_NODES[1],fen,TO));
-    /* chess-api WS depth 12 — résultat rapide */
-    sources.push(srcChessApiWS(fen,12,5000));
-    /* chess-api WS depth 18 — plus fort */
-    sources.push(srcChessApiWS(fen,18,TO));
-    /* chess-api WS depth 20 — le plus fort possible */
-    sources.push(srcChessApiWS(fen,20,TO));
-    /* stockfish.online depth 15 */
-    sources.push(srcStockfishOnline(fen,8000));
-    /* lichess cloud-eval — instantané si position connue */
-    sources.push(srcLichessCloud(fen,4000));
-
-    const total=sources.length;
     function onResult(r){
       settled++;
       if(r){
         updateCloudUI(r);
         if(!bestResult||(r.depth||0)>(bestResult.depth||0))bestResult=r;
+        /* Abort HF si une source rapide (lichess/chess-api) répond avec depth >= 18 en < 2s */
+        if((r.depth||0)>=18&&(Date.now()-t0)<2000&&r.source!=='hf'){
+          hfCtrls.forEach(c=>{try{c.abort()}catch(e){}});
+          console.log('%c☁ Abort HF (bonne réponse à '+(Date.now()-t0)+'ms depth '+r.depth+')','color:#f59e0b');
+        }
         if(!resolved){resolved=true;res(bestResult)}
       }
       if(settled>=total&&!resolved){resolved=true;res(bestResult)}
     }
+
+    /* ---- SOURCE 5 : Lichess cloud-eval EN PREMIER — quasi-instantané ---- */
+    const lichessP=srcLichessCloud(fen,4000).then(r=>{
+      if(r&&(r.depth||0)>=20){
+        /* Réponse Lichess excellente : mettre en cache et résoudre immédiatement */
+        _cache.set(fen,{result:r,ts:Date.now()});
+        updateCloudUI(r);
+        if(!resolved){resolved=true;res(r)}
+        hfCtrls.forEach(c=>{try{c.abort()}catch(e){}});
+        return r;
+      }
+      onResult(r);return r;
+    });
+
+    /* ---- Autres sources en parallèle ---- */
+    const sources=[];
+    /* HF Node 0 (streaming SSE depth 15) — avec AbortController */
+    sources.push(srcHF(HF_NODES[0],fen,TO,hfCtrls[0]));
+    /* HF Node 1 (streaming SSE depth 15) — avec AbortController */
+    sources.push(srcHF(HF_NODES[1],fen,TO,hfCtrls[1]));
+    /* chess-api WS depth 20 — une seule connexion avec résultats progressifs */
+    sources.push(srcChessApiWS(fen,20,TO));
+    /* stockfish.online depth 15 */
+    sources.push(srcStockfishOnline(fen,8000));
+    /* lichess déjà lancé séparément */
+    const total=sources.length+1; /* +1 pour lichess */
+
     sources.forEach(p=>p.then(onResult));
     setTimeout(()=>{if(!resolved){resolved=true;res(bestResult)}},TO+500);
+
+    /* Mettre en cache le meilleur résultat final */
+    Promise.all([lichessP,...sources]).then(()=>{
+      if(bestResult)_cache.set(fen,{result:bestResult,ts:Date.now()});
+    });
   });
 }
 
