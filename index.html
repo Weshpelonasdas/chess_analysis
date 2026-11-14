@@ -191,73 +191,93 @@ async function ai(p,mode,long){return callLLM([{role:'system',content:long?'Tu e
 /* ---- Stockfish local ---- */
 let sf,q=Promise.resolve();
 
-/* ---- Cloud Stockfish multi-sources ---- */
-/* 2 HF Nodes (SSE streaming) + 2 APIs gratuites en parallele */
+/* ================================================================
+   CLOUD STOCKFISH — Architecture multi-sources parallèle
+   Chaque source travaille sur SON propre coup en parallèle.
+   L'UI se met à jour en live dès qu'une source répond.
+   ================================================================ */
+
 const HF_NODES=[
   'https://darkpsx-chesspro.hf.space',
   'https://darkpsx-chessapi1.hf.space'
 ];
 const HF_LAT=HF_NODES.map(()=>9999);
 
-/* Keep-alive : warmup des noeuds HF */
+/* Warmup HF nodes au démarrage + toutes les 4 min */
 (function warmup(){
+  const INIT_FEN='rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1';
   HF_NODES.forEach((url,i)=>{
     const t0=Date.now();
-    fetch(url+'/gradio_api/call/analyze',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({data:['rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1',1]})})
+    fetch(url+'/gradio_api/call/analyze',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({data:[INIT_FEN,1]})})
       .then(r=>r.json()).then(({event_id})=>fetch(url+'/gradio_api/call/analyze/'+event_id))
-      .then(()=>{HF_LAT[i]=Date.now()-t0;console.log('%c\u2601 Warmup '+i+' OK ('+HF_LAT[i]+'ms)','color:#22c55e')})
+      .then(()=>{HF_LAT[i]=Date.now()-t0;console.log('%c\u2601 HF'+i+' ready ('+HF_LAT[i]+'ms)','color:#22c55e')})
       .catch(()=>{});
   });
   setInterval(warmup,240000);
 })();
 
-/* Met a jour l'UI des qu'un resultat cloud partiel arrive */
+/* ---- Mise à jour UI : monotone croissante en profondeur ---- */
+let _cbd=-1; /* cloud best depth */
 function updateCloudUI(r){
+  if(!r||!r.best)return;
+  const d=r.depth||0;
+  if(d<_cbd)return; /* ignorer si moins profond */
+  _cbd=d;
   try{
-    if(r.evaluation){const el=document.getElementById('evl');if(el)el.textContent=r.evaluation}
+    if(r.evaluation){const el=document.getElementById('evl');if(el)el.textContent=r.evaluation+'  d'+d}
     const badge=document.getElementById('cloud-badge');if(badge)badge.style.display='inline';
-    if(r.best){const bm=document.getElementById('bm');if(bm)bm.innerHTML=r.best+'<span style="background:#2563eb;color:#fff;font-size:9px;padding:1px 4px;border-radius:3px;margin-left:4px">\u2601</span>'}
+    if(r.best){const bm=document.getElementById('bm');if(bm)bm.innerHTML=r.best+'<span style="background:#2563eb;color:#fff;font-size:9px;padding:1px 4px;border-radius:3px;margin-left:4px">\u2601 d'+d+'</span>'}
     if(r.cp!=null){try{setBar('ebar',r.cp)}catch(e){}}
   }catch(e){}
 }
+function resetCloudState(){_cbd=-1;}
 
-/* Noeud HF avec lecture SSE en streaming via ReadableStream */
-async function evCloudNodeStream(url,fen,depth,timeoutMs,onPartial){
+/* ---- Helpers ---- */
+function cpStr(cp){
+  if(Math.abs(cp)>9000)return'Mat';
+  const s=cp>=0?'+':'';return s+(cp/100).toFixed(2);
+}
+function normCp(j,side){
+  /* chess-api retourne eval en perspective du camp qui joue — normaliser en Blancs */
+  let cp=typeof j.centipawns==='number'?j.centipawns
+        :typeof j.eval==='number'?Math.round(j.eval*100)
+        :typeof j.evaluation==='number'?Math.round(j.evaluation*100):0;
+  if(j.mate){cp=j.mate>0?10000:-10000}
+  /* chess-api : eval déjà en perspective globale (négatif = noirs gagnent) */
+  return cp;
+}
+
+/* ================================================================
+   SOURCE 1 & 2 : HF Nodes — SSE streaming progressif
+   ================================================================ */
+async function srcHF(url,fen,timeoutMs){
   const ctrl=new AbortController(),tid=setTimeout(()=>ctrl.abort(),timeoutMs);
-  const t0=Date.now();
-  let best=null;
+  const t0=Date.now();let best=null;
   try{
-    const r1=await fetch(url+'/gradio_api/call/analyze',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({data:[fen,depth]}),signal:ctrl.signal});
+    const r1=await fetch(url+'/gradio_api/call/analyze',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({data:[fen,15]}),signal:ctrl.signal});
     if(!r1.ok)return null;
     const {event_id}=await r1.json();
     const r2=await fetch(url+'/gradio_api/call/analyze/'+event_id,{signal:ctrl.signal});
     if(!r2.ok||!r2.body)return null;
-    const reader=r2.body.getReader(),dec=new TextDecoder();
-    let buf='';
+    const reader=r2.body.getReader(),dec=new TextDecoder();let buf='';
     while(true){
-      const {done,value}=await reader.read();
-      if(done)break;
+      const{done,value}=await reader.read();if(done)break;
       buf+=dec.decode(value,{stream:true});
-      const lines=buf.split('\n');
-      buf=lines.pop();
+      const lines=buf.split('\n');buf=lines.pop();
       for(const line of lines){
         if(!line.startsWith('data:'))continue;
         try{
           const d=JSON.parse(line.slice(5).trim());
-          /* Resultat partiel streaming (done:false) */
-          if(d&&d.best_move&&!d.done){
-            const partial={cp:d.eval_num||0,best:d.best_move,evaluation:d.evaluation||'',pv:[d.best_move],cloud:true,depth:d.depth||0};
-            if(onPartial)onPartial(partial);
-            best=partial;
-          }
-          /* Resultat final (done:true ou tableau Gradio) */
-          if(d&&d.done&&d.best_move){
-            const idx=HF_NODES.indexOf(url);if(idx>=0)HF_LAT[idx]=Date.now()-t0;
-            best={cp:d.eval_num||0,best:d.best_move,evaluation:d.evaluation||'',pv:[d.best_move],cloud:true,depth:d.depth||0,node:idx};
+          if(d&&d.best_move){
+            const r={cp:d.eval_num||0,best:d.best_move,evaluation:d.evaluation||'',depth:d.depth||0,cloud:true};
+            updateCloudUI(r);best=r;
           }
           if(Array.isArray(d)&&d[0]&&d[0].best_move){
             const idx=HF_NODES.indexOf(url);if(idx>=0)HF_LAT[idx]=Date.now()-t0;
-            best={cp:d[0].eval_num||0,best:d[0].best_move,evaluation:d[0].evaluation||'',pv:[d[0].best_move],cloud:true,node:idx};
+            const r={cp:d[0].eval_num||0,best:d[0].best_move,evaluation:d[0].evaluation||'',depth:d[0].depth||15,cloud:true};
+            updateCloudUI(r);best=r;
           }
         }catch(e){}
       }
@@ -266,72 +286,108 @@ async function evCloudNodeStream(url,fen,depth,timeoutMs,onPartial){
   return best;
 }
 
-/* API gratuite stockfish.online */
-async function evStockfishOnline(fen,timeoutMs){
+/* ================================================================
+   SOURCE 3 : chess-api.com WebSocket — streaming live progressif
+   depth 12, 18 et 20 en 3 connexions séparées
+   ================================================================ */
+function srcChessApiWS(fen,depth,timeoutMs){
+  return new Promise(res=>{
+    let best=null,done=false;
+    const tid=setTimeout(()=>{if(!done){done=true;res(best)}},timeoutMs);
+    try{
+      const ws=new WebSocket('wss://chess-api.com/v1');
+      ws.onopen=()=>ws.send(JSON.stringify({fen,depth,maxThinkingTime:100,variants:1}));
+      ws.onmessage=e=>{
+        try{
+          const j=JSON.parse(e.data);
+          if(!j||!j.move&&!j.from)return;
+          const mv=j.move||j.from+j.to+(j.promotion||'');
+          if(!mv)return;
+          const cp=normCp(j);
+          const r={cp,best:mv,evaluation:cpStr(cp),depth:j.depth||depth,cloud:true,source:'chess-api'};
+          updateCloudUI(r);best=r;
+          if(j.type==='bestmove'&&!done){done=true;clearTimeout(tid);ws.close();res(best)}
+        }catch(err){}
+      };
+      ws.onerror=()=>{if(!done){done=true;clearTimeout(tid);res(best)}};
+      ws.onclose=()=>{if(!done){done=true;clearTimeout(tid);res(best)}};
+    }catch(e){if(!done){done=true;clearTimeout(tid);res(null)}}
+  });
+}
+
+/* ================================================================
+   SOURCE 4 : stockfish.online — depth max 15 (REST)
+   ================================================================ */
+async function srcStockfishOnline(fen,timeoutMs){
   const ctrl=new AbortController(),tid=setTimeout(()=>ctrl.abort(),timeoutMs);
   try{
-    const url='https://stockfish.online/api/s/v2.php?fen='+encodeURIComponent(fen)+'&depth=12';
-    const r=await fetch(url,{signal:ctrl.signal});
+    const r=await fetch('https://stockfish.online/api/s/v2.php?fen='+encodeURIComponent(fen)+'&depth=15',{signal:ctrl.signal});
     if(!r.ok)return null;
     const j=await r.json();
-    if(!j.bestmove)return null;
+    if(!j.success||!j.bestmove)return null;
     const mv=j.bestmove.replace(/^bestmove\s+/,'').split(' ')[0];
     if(!mv||mv==='(none)')return null;
-    const cp=typeof j.evaluation==='number'?Math.round(j.evaluation*100):(typeof j.mate==='number'?(j.mate>0?10000:-10000):0);
-    const sign=cp>=0?'+':'';
-    const ev_str=Math.abs(cp)>9000?'Mat':(sign+(cp/100).toFixed(2));
-    return{cp,best:mv,evaluation:ev_str,pv:[mv],cloud:true,source:'stockfish.online'};
+    const cp=typeof j.evaluation==='number'?Math.round(j.evaluation*100)
+              :(typeof j.mate==='number'?(j.mate>0?10000:-10000):0);
+    return{cp,best:mv,evaluation:cpStr(cp),depth:15,cloud:true,source:'sf.online'};
   }catch(e){}finally{clearTimeout(tid)}
   return null;
 }
 
-/* API gratuite chess-api.com */
-async function evChessApi(fen,timeoutMs){
+/* ================================================================
+   SOURCE 5 : Lichess cloud-eval — quasi-instantané (positions connues)
+   ================================================================ */
+async function srcLichessCloud(fen,timeoutMs){
   const ctrl=new AbortController(),tid=setTimeout(()=>ctrl.abort(),timeoutMs);
   try{
-    const r=await fetch('https://chess-api.com/v1',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({fen,depth:12}),signal:ctrl.signal});
+    const r=await fetch('https://lichess.org/api/cloud-eval?fen='+encodeURIComponent(fen)+'&multiPv=1',{signal:ctrl.signal});
     if(!r.ok)return null;
     const j=await r.json();
-    if(!j.move&&!j.san)return null;
-    const mv=j.move||j.from+j.to+(j.promotion||'');
-    if(!mv)return null;
-    const cp=typeof j.centipawns==='number'?j.centipawns:(typeof j.eval==='number'?Math.round(j.eval*100):0);
-    const sign=cp>=0?'+':'';
-    const ev_str=Math.abs(cp)>9000?'Mat':(sign+(cp/100).toFixed(2));
-    return{cp,best:mv,evaluation:ev_str,pv:[mv],cloud:true,source:'chess-api.com'};
+    const pv=j.pvs&&j.pvs[0];if(!pv)return null;
+    const mv=(pv.moves||'').split(' ')[0];if(!mv)return null;
+    const cp=pv.mate!=null?(pv.mate>0?10000:-10000):(pv.cp||0);
+    return{cp,best:mv,evaluation:cpStr(cp),depth:j.depth||20,cloud:true,source:'lichess'};
   }catch(e){}finally{clearTimeout(tid)}
   return null;
 }
 
-/* evCloud : 4 sources en parallele, maj UI en temps reel, retourne le meilleur resultat */
+/* ================================================================
+   evCloud : toutes sources en parallèle, chacune sur son propre coup
+   ================================================================ */
 function evCloud(fen){
-  const depth=15,timeout=7000;
-  /* Tri HF par latence */
-  const sorted=[...HF_NODES.keys()].sort((a,b)=>HF_LAT[a]-HF_LAT[b]);
+  resetCloudState();
+  const TO=9000; /* timeout global */
   return new Promise(res=>{
+    const sources=[];
     let settled=0,bestResult=null,resolved=false;
-    const total=4;
+
+    /* HF Node 0 (streaming SSE depth 15) */
+    sources.push(srcHF(HF_NODES[0],fen,TO));
+    /* HF Node 1 (streaming SSE depth 15) */
+    sources.push(srcHF(HF_NODES[1],fen,TO));
+    /* chess-api WS depth 12 — résultat rapide */
+    sources.push(srcChessApiWS(fen,12,5000));
+    /* chess-api WS depth 18 — plus fort */
+    sources.push(srcChessApiWS(fen,18,TO));
+    /* chess-api WS depth 20 — le plus fort possible */
+    sources.push(srcChessApiWS(fen,20,TO));
+    /* stockfish.online depth 15 */
+    sources.push(srcStockfishOnline(fen,8000));
+    /* lichess cloud-eval — instantané si position connue */
+    sources.push(srcLichessCloud(fen,4000));
+
+    const total=sources.length;
     function onResult(r){
       settled++;
       if(r){
-        /* Mise a jour UI immediate */
         updateCloudUI(r);
-        /* Garder le meilleur cp (perspective blanche) */
-        if(!bestResult||Math.abs(r.cp)>Math.abs(bestResult.cp))bestResult=r;
+        if(!bestResult||(r.depth||0)>(bestResult.depth||0))bestResult=r;
         if(!resolved){resolved=true;res(bestResult)}
       }
       if(settled>=total&&!resolved){resolved=true;res(bestResult)}
     }
-    /* HF Node 0 */
-    evCloudNodeStream(HF_NODES[sorted[0]],fen,depth,timeout,r=>updateCloudUI(r)).then(onResult);
-    /* HF Node 1 */
-    evCloudNodeStream(HF_NODES[sorted[1]],fen,depth,timeout,r=>updateCloudUI(r)).then(onResult);
-    /* stockfish.online */
-    evStockfishOnline(fen,timeout).then(onResult);
-    /* chess-api.com */
-    evChessApi(fen,timeout).then(onResult);
-    /* Timeout global de securite */
-    setTimeout(()=>{if(!resolved){resolved=true;res(bestResult)}},timeout+500);
+    sources.forEach(p=>p.then(onResult));
+    setTimeout(()=>{if(!resolved){resolved=true;res(bestResult)}},TO+500);
   });
 }
 
